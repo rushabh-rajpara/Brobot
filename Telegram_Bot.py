@@ -95,7 +95,6 @@ Here’s what I can do for you:
 /schedule – Set job hours
 /goal – Set today's main goal
 /status – Your current stats
-/mood – how you're feeling today
 /pause – Pause check-ins
 /resume – Resume check-ins
 /showschedule – View weekly job schedule
@@ -145,13 +144,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_checkin_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower().strip()
 
+    
+    
+
     # --- Handle goal setting if not already set
     if not get_goal():
         save_goal(text)
         await update.message.reply_text(f"🔒 Got it! Today’s goal locked in:\n\"{text}\"")
         return
     
-    text = update.message.text.lower().strip()
 
 
     # --- Handle goal completion response
@@ -180,6 +181,32 @@ async def handle_checkin_response(update: Update, context: ContextTypes.DEFAULT_
 
     else:
         await update.message.reply_text("Hmm… noted. BRBot always remembers. 😎")
+
+        # --- SMART RESPONSE ENGINE 🔥
+    distracted_keywords = [
+        "youtube", "scroll", "instagram", "netflix", "tired", "watching", "gaming", "bored",
+        "memes", "sleep", "nap", "tv", "chilling", "reels", "whatsapp", "snap", "discord", "lazy"
+    ]
+
+    focused_keywords = [
+        "working", "coding", "portfolio", "building", "writing", "editing", "studying", "research",
+        "reading", "grinding", "learning", "practicing", "task", "goal", "hustling"
+    ]
+
+    if any(word in text for word in distracted_keywords):
+        if random.randint(1, 3) == 1:
+            await update.message.reply_text(random.choice(load_lines("roast_lines.txt")))
+        else:
+            await update.message.reply_text(random.choice(load_lines("support_lines.txt")))
+        return
+
+    elif any(word in text for word in focused_keywords):
+        await update.message.reply_text("Nice! Keep going—you're in the zone 🚀")
+        return
+
+    else:
+        await update.message.reply_text(random.choice(load_lines("support_lines.txt")))
+        return
 
 
 
