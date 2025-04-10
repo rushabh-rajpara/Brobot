@@ -210,9 +210,7 @@ async def handle_checkin_response(update: Update, context: ContextTypes.DEFAULT_
 
 
 
-# UNKNOWN TEXTS
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hey Rushabh, I didn't get that. Try /help if you're lost. 🧭")
+
 
 async def send_morning_message(application):
     from telegram import Bot
@@ -359,7 +357,6 @@ if __name__ == '__main__':
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_checkin_response))
     app.add_handler(CommandHandler("pause", pause))
     app.add_handler(CommandHandler("resume", resume))
