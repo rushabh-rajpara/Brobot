@@ -5,6 +5,8 @@ import datetime
 import asyncio
 import json
 import os
+from pytz import timezone
+
 
 from pymongo import MongoClient
 
@@ -13,6 +15,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID"))
 client = MongoClient(MONGO_URI)
 db = client["Brobot"]
+
+toronto = timezone("America/Toronto")
+
 
 goals_col = db["goals"]
 schedule_col = db["schedule"]
@@ -372,14 +377,14 @@ if __name__ == '__main__':
 
     # Set up daily scheduler
     scheduler = BackgroundScheduler()
-    scheduler.add_job(lambda: asyncio.run(send_morning_message(app)), 'cron', hour=9, minute=00)
+    scheduler.add_job(lambda: asyncio.run(send_morning_message(app)), 'cron', hour=9, minute=00, timezone=toronto)
     # 9:05 AM - ask for goal
-    scheduler.add_job(lambda: asyncio.run(ask_daily_goal(app)), 'cron', hour=9, minute=5)
+    scheduler.add_job(lambda: asyncio.run(ask_daily_goal(app)), 'cron', hour=9, minute=5, timezone=toronto)
 
 
 
     # 10:30 PM - ask if goal was completed
-    scheduler.add_job(lambda: asyncio.run(ask_goal_completion(app)), 'cron', hour=22, minute=30)
+    scheduler.add_job(lambda: asyncio.run(ask_goal_completion(app)), 'cron', hour=22, minute=30, timezone=toronto)
     scheduler.start()
 
     scheduler.add_job(
@@ -387,7 +392,8 @@ if __name__ == '__main__':
     'cron',
     day_of_week='sun',
     hour=9,
-    minute=0
+    minute=0,
+    timezone=toronto
     )
 
 for hour in [11, 13, 15, 17, 19]:  # Adjust these times if needed
@@ -395,7 +401,8 @@ for hour in [11, 13, 15, 17, 19]:  # Adjust these times if needed
         lambda: asyncio.run(send_checkin(app)),
         'cron',
         hour=hour,
-        minute=0
+        minute=0,
+        timezone=toronto
     )
 
 
