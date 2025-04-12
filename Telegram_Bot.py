@@ -489,22 +489,21 @@ for hour in [11, 13, 15, 17, 19]:  # Adjust these times if needed
         minute=0,
         timezone=toronto
     )
-
-
     
-    
-    scheduler.add_job(
-        lambda: asyncio.run(midday_goal_reminder(app)),
     scheduler.add_job(
         lambda: asyncio.run(passive_check(app)),
-        "interval",
+        trigger="interval",
         hours=5
-    ),
-        'cron',
+)
+
+    scheduler.add_job(
+        lambda: asyncio.run(midday_goal_reminder(app)),
+        trigger='cron',
         hour=13,
         minute=30,
         timezone=toronto
-    )
+)
+
 
     
     scheduler.add_job(
@@ -514,7 +513,9 @@ for hour in [11, 13, 15, 17, 19]:  # Adjust these times if needed
         hour=0,
         minute=0,
         timezone=toronto
-    )
+)
+
+
 
     print("BRBot is running with scheduled morning message... 🌞")
     app.run_polling()
