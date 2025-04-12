@@ -362,8 +362,9 @@ async def streak(update: Update, context: ContextTypes.DEFAULT_TYPE):
     streak = get_streak()
     chart = get_weekly_chart()
     await update.message.reply_text(
-        f"🔥 Current Streak: {streak} days in a row! 📈 Weekly Progress:{chart}"
-    )
+    f"🔥 Current Streak: {streak} days in a row!\n\n📈 Weekly Progress:\n{chart}"
+)
+
 
 
 
@@ -377,7 +378,7 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "✅" if doc and doc.get("done") else "❌"
         goal_text = doc.get("goal", "No goal") if doc else "No goal"
         messages.append(f"{status} {date_str}: {goal_text}")
-    await update.message.reply_text("🗓️ Goal History (Last 7 Days): " + " ".join(messages))
+    await update.message.reply_text("🗓️ Goal History (Last 7 Days):\n" + "\n".join(messages))
 
 
 
