@@ -7,6 +7,24 @@ import json
 import os
 from pytz import timezone
 
+import cohere
+cohere_client = cohere.Client(os.getenv("COHERE_API_KEY"))  # Load from environment
+api_call_count = {"cohere": 0}
+
+def get_cohere_reply(prompt):
+    try:
+        global api_call_count
+        api_call_count["cohere"] += 1
+        response = cohere_client.chat(
+            message=prompt,
+            model="command-r-plus",
+            temperature=0.7
+        )
+        return response.text
+    except Exception as e:
+        return "⚠️ Couldn't reach Cohere: " + str(e)
+
+
 
 from pymongo import MongoClient
 
@@ -146,75 +164,13 @@ async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text)
 
+
 async def handle_checkin_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower().strip()
 
-    
-    
-
-    # --- Handle goal setting if not already set
-    if not get_goal():
-        save_goal(text)
-        await update.message.reply_text(f"🔒 Got it! Today’s goal locked in:\n\"{text}\"")
-        return
-    
-
-
-    # --- Handle goal completion response
-    if "yes" in text and get_goal():
-        await update.message.reply_text(random.choice(load_lines('goal_done.txt')))
-        save_goal("")  # Reset goal for tomorrow
-        return
-
-    elif "no" in text and get_goal():
-        await update.message.reply_text(random.choice(load_lines('goal_missed.txt')))
-        save_goal("")  # Reset goal for tomorrow
-        return
-
-    # --- Handle Check-in Responses
-    if "focused" in text:
-        await update.message.reply_text("Locked in. Keep crushing it 💪")
-
-    elif "gaming" in text or "watching" in text or "scrolling" in text:
-        await update.message.reply_text("Hmm... did you do your main tasks first? (Yes/No)")
-
-    elif "break" in text:
-        await update.message.reply_text("Short break? Cool. Don’t forget to bounce back ⏱️")
-
-    elif "something" in text:
-        await update.message.reply_text("Got it. BRBot is watching 👀")
-
-    else:
-        await update.message.reply_text("Hmm… noted. BRBot always remembers. 😎")
-
-        # --- SMART RESPONSE ENGINE 🔥
-    distracted_keywords = [
-        "youtube", "scroll", "instagram", "netflix", "tired", "watching", "gaming", "bored",
-        "memes", "sleep", "nap", "tv", "chilling", "reels", "whatsapp", "snap", "discord", "lazy"
-    ]
-
-    focused_keywords = [
-        "working", "coding", "portfolio", "building", "writing", "editing", "studying", "research",
-        "reading", "grinding", "learning", "practicing", "task", "goal", "hustling"
-    ]
-
-    if any(word in text for word in distracted_keywords):
-        if random.randint(1, 3) == 1:
-            await update.message.reply_text(random.choice(load_lines("roast_lines.txt")))
-        else:
-            await update.message.reply_text(random.choice(load_lines("support_lines.txt")))
-        return
-
-    elif any(word in text for word in focused_keywords):
-        await update.message.reply_text("Nice! Keep going—you're in the zone 🚀")
-        return
-
-    else:
-        await update.message.reply_text(random.choice(load_lines("support_lines.txt")))
-        return
-
-
-
+    # Count & process with Cohere
+    cohere_reply = get_cohere_reply(f"User says: '{text}'. Respond as a smart accountability partner who keeps Rushabh motivated and on track with his goals.")
+    await update.message.reply_text(cohere_reply)
 
 
 async def send_morning_message(application):
@@ -317,6 +273,12 @@ async def show_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 
+
+async def apicount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    count = api_call_count.get("cohere", 0)
+    await update.message.reply_text(f"🧠 Cohere API calls used: {count}")
+
+
 async def weekly_report(application):
     if is_paused():
         return
@@ -369,6 +331,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("schedule", set_schedule))
     app.add_handler(CommandHandler("showschedule", show_schedule))
+    app.add_handler(CommandHandler("apicount", apicount))
 
 
 
