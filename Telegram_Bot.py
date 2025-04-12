@@ -111,6 +111,8 @@ start_messages = [
     "Morning, legend. Let’s get this bread. 🍞"
 ]
 
+
+
 help_text = """
 Here’s what I can do for you:
 /start – Wake me up
@@ -121,7 +123,12 @@ Here’s what I can do for you:
 /pause – Pause check-ins
 /resume – Resume check-ins
 /showschedule – View weekly job schedule
+/streak – Show your goal streak and progress
+/apicount – Show Cohere API usage
+/history – See last 7 days of goal tracking
 """
+
+
 
 import random
 
@@ -165,11 +172,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text)
 
 
+
 async def handle_checkin_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower().strip()
+    goal = get_goal()
+    prompt = f"""
+Rushabh said: '{text}'.
 
-    # Count & process with Cohere
-    cohere_reply = get_cohere_reply(f"User says: '{text}'. Respond as a smart accountability partner who keeps Rushabh motivated and on track with his goals.")
+His main goal for today is: '{goal}'.
+
+You are a motivational accountability buddy. Respond like a supportive, no-nonsense friend who keeps him on track and focused on that goal.
+"""
+    cohere_reply = get_cohere_reply(prompt)
     await update.message.reply_text(cohere_reply)
 
 
@@ -279,6 +293,106 @@ async def apicount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🧠 Cohere API calls used: {count}")
 
 
+
+async def midday_goal_reminder(application):
+    from telegram import Bot
+    bot = Bot(token=BOT_TOKEN)
+    goal = get_goal()
+
+    if goal:
+      await bot.send_message(
+        chat_id=CHAT_ID,
+        text=f"⏰ Midday Reminder! Your goal today is: '{goal}' Are you working on it? Let’s lock in 🔒"
+    )
+
+            
+            
+    else:
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text="⏰ Midday Reminder! You haven't set a goal for today yet. Use /goal to set one!"
+        )
+
+
+
+def get_streak():
+    today = datetime.date.today()
+    streak = 0
+    for i in range(7):
+        day = today - datetime.timedelta(days=i)
+        doc = goals_col.find_one({"date": day.isoformat()})
+        if doc and doc.get("done") is True:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def get_weekly_chart():
+    today = datetime.date.today()
+    emojis = []
+    for i in range(6, -1, -1):
+        day = today - datetime.timedelta(days=i)
+        doc = goals_col.find_one({"date": day.isoformat()})
+        if doc and doc.get("done") is True:
+            emojis.append("✅")
+        else:
+            emojis.append("❌")
+    return " ".join(emojis)
+
+
+
+
+def get_badge(streak):
+    if streak >= 30:
+        return "🏆 Platinum Crown – Rushabh Mode: Unstoppable 👑"
+    elif streak >= 14:
+        return "🔥 Flame Badge – Certified focused beast"
+    elif streak >= 7:
+        return "🥇 Gold Badge – You're locked in, legend"
+    elif streak >= 4:
+        return "🥈 Silver Badge – Building momentum"
+    elif streak >= 1:
+        return "🥉 Bronze Badge – Getting warmed up"
+    else:
+        return "😴 No Badge Yet – Time to start a streak!"
+
+
+async def streak(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    streak = get_streak()
+    chart = get_weekly_chart()
+    await update.message.reply_text(
+        f"🔥 Current Streak: {streak} days in a row! 📈 Weekly Progress:{chart}"
+    )
+
+
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.date.today()
+    messages = []
+    for i in range(6, -1, -1):
+        day = today - datetime.timedelta(days=i)
+        date_str = day.strftime("%a %d %b")
+        doc = goals_col.find_one({"date": day.isoformat()})
+        status = "✅" if doc and doc.get("done") else "❌"
+        goal_text = doc.get("goal", "No goal") if doc else "No goal"
+        messages.append(f"{status} {date_str}: {goal_text}")
+    await update.message.reply_text("🗓️ Goal History (Last 7 Days): " + " ".join(messages))
+
+
+
+async def passive_check(application):
+    from telegram import Bot
+    bot = Bot(token=BOT_TOKEN)
+    goal = get_goal()
+
+    if not goal:
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text="👀 You haven’t set a goal in a while. What’s the move, boss? Use /goal to lock one in."
+        )
+
+
 async def weekly_report(application):
     if is_paused():
         return
@@ -319,6 +433,12 @@ Let’s aim even higher next week, king 👑
 
 
 # MAIN FUNCTION
+
+def reset_api_counter():
+    global api_call_count
+    api_call_count["cohere"] = 0
+
+
 if __name__ == '__main__':
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -331,6 +451,8 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("schedule", set_schedule))
     app.add_handler(CommandHandler("showschedule", show_schedule))
+    app.add_handler(CommandHandler("streak", streak))
+    app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("apicount", apicount))
 
 
@@ -370,5 +492,29 @@ for hour in [11, 13, 15, 17, 19]:  # Adjust these times if needed
 
 
     
+    
+    scheduler.add_job(
+        lambda: asyncio.run(midday_goal_reminder(app)),
+    scheduler.add_job(
+        lambda: asyncio.run(passive_check(app)),
+        "interval",
+        hours=5
+    ),
+        'cron',
+        hour=13,
+        minute=30,
+        timezone=toronto
+    )
+
+    
+    scheduler.add_job(
+        reset_api_counter,
+        'cron',
+        day=1,
+        hour=0,
+        minute=0,
+        timezone=toronto
+    )
+
     print("BRBot is running with scheduled morning message... 🌞")
     app.run_polling()
