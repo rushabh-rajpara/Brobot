@@ -81,13 +81,27 @@ def save_schedule(data):
         schedule_col.insert_one({"day": day, "time": time})
 
 
-def is_working_now():
-    schedule = load_schedule()
-    now = datetime.datetime.now()
-    day = now.strftime("%a").lower()[:3]
 
-    if schedule.get(day) == "off":
-        return False
+def is_working_now():
+    schedule_doc = db["schedule"].find()
+    now = datetime.datetime.now(toronto)
+    current_day = now.strftime("%a").lower()[:3]
+    current_time = now.time()
+
+    for entry in schedule_doc:
+        if entry["day"] == current_day:
+            time_range = entry["time"]
+            if time_range == "off":
+                return False
+            try:
+                start_str, end_str = time_range.split("-")
+                start = datetime.datetime.strptime(start_str, "%H:%M").time()
+                end = datetime.datetime.strptime(end_str, "%H:%M").time()
+                return start <= current_time <= end
+            except:
+                return False
+    return False
+
 
     time_range = schedule.get(day)
     if time_range:
