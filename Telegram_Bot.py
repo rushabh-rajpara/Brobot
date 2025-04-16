@@ -47,6 +47,14 @@ pause_col = db["pause"]
 def save_goal(goal):
     goals_col.replace_one({"type": "daily"}, {"type": "daily", "goal": goal}, upsert=True)
 
+
+def get_goal_context():
+    doc = goals_col.find_one({"type": "daily"})
+    if not doc:
+        return "", False
+    return doc.get("goal", ""), doc.get("done", False)
+
+
 def get_goal():
     doc = goals_col.find_one({"type": "daily"})
     return doc["goal"] if doc else ""
@@ -173,18 +181,36 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
 async def handle_checkin_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower().strip()
-    goal = get_goal()
-    prompt = f"""
-Rushabh said: '{text}'.
 
-His main goal for today is: '{goal}'.
+    if text in ["yes", "i did", "done", "completed"]:
+        if goals_col.find_one({"type": "daily", "awaiting_check": True}):
+            goals_col.update_one({"type": "daily"}, {"$set": {"done": True, "awaiting_check": False}})
+            await update.message.reply_text("🔥 Goal marked as completed! You crushed it today.")
+            return
 
-You are a motivational accountability buddy. Respond like a supportive, no-nonsense friend who keeps him on track and focused on that goal.
-"""
+    if text in ["no", "not yet", "failed"]:
+        if goals_col.find_one({"type": "daily", "awaiting_check": True}):
+            goals_col.update_one({"type": "daily"}, {"$set": {"done": False, "awaiting_check": False}})
+            await update.message.reply_text("Thanks for being honest. Tomorrow's another shot. 🔄")
+            return
+
+    goal, done = get_goal_context()
+    status = "Working" if is_working_now() else "Free"
+    done_msg = "He has completed his goal for today." if done else "He has not completed his goal yet."
+
+    prompt = f"""Rushabh said: '{text}'.
+
+Today's goal: '{goal}'
+Goal status: {done_msg}
+Current schedule status: {status}
+
+Respond like a supportive, no-nonsense accountability partner who helps Rushabh stay focused and make better decisions."""    
     cohere_reply = get_cohere_reply(prompt)
     await update.message.reply_text(cohere_reply)
+
 
 
 async def send_morning_message(application):
