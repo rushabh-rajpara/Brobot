@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: brobot
+    env: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: COHERE_API_KEY
+        sync: false
+      - key: TZ
+        value: America/Toronto
+      - key: TELEGRAM_SECRET_TOKEN
+        generateValue: true
+      - key: CRON_SECRET
+        generateValue: true
