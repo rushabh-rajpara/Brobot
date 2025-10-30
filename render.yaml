@@ -14,6 +14,23 @@ services:
       - key: TZ
         value: America/Toronto
       - key: TELEGRAM_SECRET_TOKEN
-        generateValue: true
+        sync: false
       - key: CRON_SECRET
-        generateValue: true
+        sync: false
+
+cronJobs:
+  - name: brobot-daily-hourly-tick
+    schedule: "0 * * * *"
+    envVars:
+      - key: CRON_SECRET
+        sync: false
+    command: |
+      curl -fsS "https://brobot.onrender.com/cron/daily?secret=$CRON_SECRET"
+
+  - name: brobot-weekly-digest
+    schedule: "0 9 * * MON"
+    envVars:
+      - key: CRON_SECRET
+        sync: false
+    command: |
+      curl -fsS "https://brobot.onrender.com/cron/weekly?secret=$CRON_SECRET"
