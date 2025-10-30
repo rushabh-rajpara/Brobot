@@ -1,562 +1,459 @@
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
-from apscheduler.schedulers.background import BackgroundScheduler
-import datetime
-import asyncio
-import json
+# brobot_v2.py
+# Rushabh's state-aware discipline bot
+
 import os
-from pytz import timezone
+import random
+import datetime as dt
+from datetime import timedelta
+from zoneinfo import ZoneInfo
+
+from telegram import (
+    Update,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardRemove,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+)
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from pymongo import MongoClient, ASCENDING, DESCENDING
 
 import cohere
-cohere_client = cohere.Client(os.getenv("COHERE_API_KEY"))  # Load from environment
-api_call_count = {"cohere": 0}
 
-def get_cohere_reply(prompt):
-    try:
-        global api_call_count
-        api_call_count["cohere"] += 1
-        response = cohere_client.chat(
-            message=prompt,
-            model="command-r-plus",
-            temperature=0.7
-        )
-        return response.text
-    except Exception as e:
-        return "⚠️ Couldn't reach Cohere: " + str(e)
-
-
-
-from pymongo import MongoClient
-
-MONGO_URI = os.getenv("MONGO_URI")
+# =========================
+# ENV + CLIENTS
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = int(os.getenv("CHAT_ID"))
-client = MongoClient(MONGO_URI)
-db = client["Brobot"]
+MONGO_URI = os.getenv("MONGO_URI")
+COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+CHAT_ID = int(os.getenv("CHAT_ID", "0"))  # optional if you only DM yourself
+TZ = os.getenv("TZ", "America/Toronto")
+TZINFO = ZoneInfo(TZ)
 
-toronto = timezone("America/Toronto")
+if not (BOT_TOKEN and MONGO_URI and COHERE_API_KEY):
+    raise RuntimeError("Missing one of BOT_TOKEN / MONGO_URI / COHERE_API_KEY env vars")
 
+co = cohere.Client(COHERE_API_KEY)
+mongo = MongoClient(MONGO_URI)
+db = mongo["Brobot"]
 
-goals_col = db["goals"]
-schedule_col = db["schedule"]
-pause_col = db["pause"]
+# Collections (fresh schema)
+users = db["users"]              # {user_id, name, streak, missed_days, checkin_hour, created_at}
+goals = db["goals"]              # {user_id, goal, why, updated_at}
+logs = db["logs"]                # {user_id, ts, kind, data}
+state = db["state"]              # {user_id, mood, energy, focus, cooldown_until, last_checkin}
 
+# Indexes (idempotent)
+users.create_index([("user_id", ASCENDING)], unique=True)
+goals.create_index([("user_id", ASCENDING), ("goal", ASCENDING)], unique=True)
+logs.create_index([("user_id", ASCENDING), ("ts", DESCENDING)])
+state.create_index([("user_id", ASCENDING)], unique=True)
 
-# ✅ MongoDB Logic Replaces All File-Based Storage
+# =========================
+# UTILITIES
+# =========================
+def now():
+    return dt.datetime.now(TZINFO)
 
-def save_goal(goal):
-    goals_col.replace_one({"type": "daily"}, {"type": "daily", "goal": goal}, upsert=True)
-
-
-def get_goal_context():
-    doc = goals_col.find_one({"type": "daily"})
-    if not doc:
-        return "", False
-    return doc.get("goal", ""), doc.get("done", False)
-
-
-def get_goal():
-    doc = goals_col.find_one({"type": "daily"})
-    return doc["goal"] if doc else ""
-
-def is_paused():
-    doc = pause_col.find_one({"type": "pause"})
-    return bool(doc)
-
-def pause_bot():
-    pause_col.replace_one({"type": "pause"}, {"type": "pause", "status": True}, upsert=True)
-
-def resume_bot():
-    pause_col.delete_one({"type": "pause"})
-
-def load_schedule():
-    schedule = {}
-    for doc in schedule_col.find():
-        schedule[doc["day"]] = doc["time"]
-    return schedule
-
-def save_schedule(data):
-    schedule_col.delete_many({})
-    for day, time in data.items():
-        schedule_col.insert_one({"day": day, "time": time})
-
-
-
-def is_working_now():
-    schedule_doc = db["schedule"].find()
-    now = datetime.datetime.now(toronto)
-    current_day = now.strftime("%a").lower()[:3]
-    current_time = now.time()
-
-    for entry in schedule_doc:
-        if entry["day"] == current_day:
-            time_range = entry["time"]
-            if time_range == "off":
-                return False
-            try:
-                start_str, end_str = time_range.split("-")
-                start = datetime.datetime.strptime(start_str, "%H:%M").time()
-                end = datetime.datetime.strptime(end_str, "%H:%M").time()
-                return start <= current_time <= end
-            except:
-                return False
-    return False
-
-
-    time_range = schedule.get(day)
-    if time_range:
-        try:
-            start_str, end_str = time_range.split("-")
-            start = datetime.datetime.strptime(start_str, "%H:%M").time()
-            end = datetime.datetime.strptime(end_str, "%H:%M").time()
-            now_time = now.time()
-            return start <= now_time <= end
-        except:
-            return False
-
-    return False
-
-
-
-
-
-
-
-
-
-# List of rotating welcome messages
-start_messages = [
-    "Yo Rushabh! BRBot reporting for duty 💼",
-    "Time to rise, grind, and code, boss! 💻",
-    "I got your back today. Ready to crush it? 🚀",
-    "Another day to dominate. Let’s gooo 🔥",
-    "Morning, legend. Let’s get this bread. 🍞"
-]
-
-
-
-help_text = """
-Here’s what I can do for you:
-/start – Wake me up
-/help – Show this list
-/schedule – Set job hours
-/goal – Set today's main goal
-/status – Your current stats
-/pause – Pause check-ins
-/resume – Resume check-ins
-/showschedule – View weekly job schedule
-/streak – Show your goal streak and progress
-/apicount – Show Cohere API usage
-/history – See last 7 days of goal tracking
-"""
-
-
-
-import random
-
-def load_lines(filename):
-    with open(filename, 'r', encoding='utf-8') as f:
-        return [line.strip() for line in f.readlines() if line.strip()]
-
-morning_messages = load_lines('morning.txt')
-
-checkin_options = [
-    ["✅ Focused"],
-    ["🕹️ Gaming / Watching"],
-    ["📱 Scrolling / Wasting Time"],
-    ["😴 Break / Nap"],
-    ["✍️ Something else"]
-]
-
-
-
-import random
-
-def load_lines(filename):
-    with open(filename, 'r', encoding='utf-8') as f:
-        return [line.strip() for line in f.readlines() if line.strip()]
-
-# START COMMAND
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(random.choice(start_messages))
-
-async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pause_bot()
-    await update.message.reply_text("⛔ Bot check-ins paused. I’ll be chillin’ till you say `/resume`.")
-
-async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    resume_bot()
-    await update.message.reply_text("✅ Bot check-ins resumed. Let’s get back to work!")
-
-
-# HELP COMMAND
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(help_text)
-
-
-
-
-async def handle_checkin_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.lower().strip()
-
-    if text in ["yes", "i did", "done", "completed"]:
-        if goals_col.find_one({"type": "daily", "awaiting_check": True}):
-            goals_col.update_one({"type": "daily"}, {"$set": {"done": True, "awaiting_check": False}})
-            await update.message.reply_text("🔥 Goal marked as completed! You crushed it today.")
-            return
-
-    if text in ["no", "not yet", "failed"]:
-        if goals_col.find_one({"type": "daily", "awaiting_check": True}):
-            goals_col.update_one({"type": "daily"}, {"$set": {"done": False, "awaiting_check": False}})
-            await update.message.reply_text("Thanks for being honest. Tomorrow's another shot. 🔄")
-            return
-
-    goal, done = get_goal_context()
-    status = "Working" if is_working_now() else "Free"
-    done_msg = "He has completed his goal for today." if done else "He has not completed his goal yet."
-
-    prompt = f"""Rushabh said: '{text}'.
-
-Today's goal: '{goal}'
-Goal status: {done_msg}
-Current schedule status: {status}
-
-Respond like a supportive, no-nonsense accountability partner who helps Rushabh stay focused and make better decisions."""    
-    cohere_reply = get_cohere_reply(prompt)
-    await update.message.reply_text(cohere_reply)
-
-
-
-async def send_morning_message(application):
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
-    message = random.choice(morning_messages)
-    await bot.send_message(chat_id=CHAT_ID, text=f"🌞 Morning Rushabh!\n\n{message}")
-
-async def ask_daily_goal(application):
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
-    await bot.send_message(
-        chat_id=CHAT_ID,
-        text="🎯 What's your main goal for today?\nJust reply with one sentence. No pressure, just purpose."
+def ensure_user(user_id, name):
+    users.update_one(
+        {"user_id": user_id},
+        {
+            "$setOnInsert": {
+                "user_id": user_id,
+                "name": name,
+                "streak": 0,
+                "missed_days": 0,
+                "checkin_hour": 8,
+                "created_at": now(),
+            }
+        },
+        upsert=True,
+    )
+    state.update_one(
+        {"user_id": user_id},
+        {"$setOnInsert": {
+            "user_id": user_id,
+            "mood": None,
+            "energy": None,
+            "focus": None,
+            "cooldown_until": None,
+            "last_checkin": None,
+        }},
+        upsert=True,
     )
 
-async def set_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.args:
-        goal = " ".join(context.args)
-        save_goal(goal)
-        await update.message.reply_text(f"🔒 New goal set:\n\"{goal}\"")
-    else:
-        await update.message.reply_text("Usage: /goal Your main goal for today")
+def get_tone(user_doc):
+    # Mode-switching personality by performance
+    streak = user_doc.get("streak", 0)
+    missed = user_doc.get("missed_days", 0)
+    if streak >= 5:
+        return "supportive"
+    if missed >= 3:
+        return "tough"
+    return "neutral"
 
+def style_text(tone, msg):
+    if tone == "supportive":
+        return f"🔥 {msg}"
+    if tone == "tough":
+        return f"⚠️ {msg}"
+    return f"➡️ {msg}"
 
+def ai_reply(prompt):
+    # Cohere wrapper (low temp for consistency)
+    try:
+        resp = co.chat(model="command-r-plus", message=prompt, temperature=0.2)
+        return (resp.text or "").strip()
+    except Exception as e:
+        return f"(Local coach) {prompt}"
 
-async def send_checkin(application):
-    if is_paused() or is_working_now():
-        return
-    
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
+def cooldown_active(user_id):
+    s = state.find_one({"user_id": user_id}) or {}
+    cu = s.get("cooldown_until")
+    return cu is not None and now() < cu
 
-    markup = ReplyKeyboardMarkup(checkin_options, one_time_keyboard=True, resize_keyboard=True)
-    await bot.send_message(
-        chat_id=CHAT_ID,
-        text="🔄 Check-in time!\nWhat are you up to right now?",
-        reply_markup=markup
+def set_cooldown(user_id, minutes=10):
+    state.update_one(
+        {"user_id": user_id},
+        {"$set": {"cooldown_until": now() + timedelta(minutes=minutes)}},
+        upsert=True,
     )
 
-async def ask_goal_completion(application):
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
-    goal = get_goal()
+def log_event(user_id, kind, data=None):
+    logs.insert_one({
+        "user_id": user_id,
+        "ts": now(),
+        "kind": kind,   # checkin|mood|done|skip|reason|insight|override
+        "data": data or {},
+    })
 
-    if goal:
-        await bot.send_message(
-            chat_id=CHAT_ID,
-            text=f"{random.choice(load_lines('night.txt'))}{goal}\"\n(Yes / No)"
-        )
-    else:
-        await bot.send_message(
-            chat_id=CHAT_ID,
-            text="🌙 Did you have a goal today? 🤔 I couldn’t find one logged."
-        )
-    
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    goal = get_goal() or "No goal set yet"
-    paused = "✅ Active" if not is_paused() else "⛔ Paused"
+def set_goal_why(user_id, goal, why):
+    goals.update_one(
+        {"user_id": user_id, "goal": goal},
+        {"$set": {"why": why, "updated_at": now()}},
+        upsert=True,
+    )
 
-    msg = f"""📊 Your Current Status:
-🎯 Goal: {goal}
-🕹️ Bot Mode: {paused}
-"""
+def get_first_goal(user_id):
+    return goals.find_one({"user_id": user_id})
+
+def get_why(user_id, goal):
+    doc = goals.find_one({"user_id": user_id, "goal": goal})
+    return (doc or {}).get("why")
+
+def bump_streak(user_id, delta=1):
+    users.update_one(
+        {"user_id": user_id},
+        {"$inc": {"streak": delta}, "$set": {"missed_days": 0}},
+        upsert=True,
+    )
+
+def bump_missed(user_id, delta=1):
+    users.update_one(
+        {"user_id": user_id},
+        {"$inc": {"missed_days": delta}},
+        upsert=True,
+    )
+
+def mood_buttons():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("😴 Tired", callback_data="mood:tired"),
+         InlineKeyboardButton("🐒 Distracted", callback_data="mood:distracted")],
+        [InlineKeyboardButton("⚡ Anxious", callback_data="mood:anxious"),
+         InlineKeyboardButton("✅ Fine", callback_data="mood:fine")]
+    ])
+
+def action_buttons(goal):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"✅ I did {goal}", callback_data=f"done:{goal}")],
+        [InlineKeyboardButton("🙅 Skip (give reason)", callback_data=f"skip:{goal}")],
+        [InlineKeyboardButton("🆘 Emergency Override", callback_data=f"override:{goal}")]
+    ])
+
+def tiny_steps(mood, goal):
+    if mood == "tired":
+        return f"Stand up. 3 deep breaths. Splash water. Then 2-minute start on {goal}."
+    if mood == "distracted":
+        return f"Close all tabs. Phone face-down. 10-minute timer. Start {goal} now."
+    if mood == "anxious":
+        return f"Inhale 4, hold 4, exhale 6 ×6. Then 1 micro-task for {goal}."
+    return f"No fluff. Start {goal}. Timer now."
+
+def praise_line(streak):
+    options = [
+        "Momentum > motivation.",
+        "You showed up. That’s the game.",
+        "Nice. Dopamine well spent.",
+        "One rep closer to the future you want.",
+    ]
+    if streak >= 3:
+        options += ["Streak is heating up.", "You’re compounding discipline."]
+    if streak >= 7:
+        options += ["Certified menace to procrastination.", "Your future self is slow-clapping."]
+    return random.choice(options)
+
+# =========================
+# COMMANDS
+# =========================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    ensure_user(user.id, user.full_name or user.username or "human")
+    msg = (
+        "Brobot v2 online — your state-aware coach.\n\n"
+        "Add a goal with a personal reason:\n"
+        "• /setgoal gym I want energy and consistency\n"
+        "• /setgoal code Freedom via skills\n\n"
+        "Daily check-in at 08:00 by default. Change: /checkintime 7  (0–23)\n"
+        "Run the loop anytime: /checkin\n"
+        "See progress: /stats"
+    )
     await update.message.reply_text(msg)
 
+async def cmd_setgoal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    ensure_user(user.id, user.full_name or "")
+    if not context.args or len(context.args) < 2:
+        return await update.message.reply_text("Usage: /setgoal <goal> <your reason>")
+    goal = context.args[0].lower()
+    why = " ".join(context.args[1:])
+    set_goal_why(user.id, goal, why)
+    log_event(user.id, "why", {"goal": goal})
+    await update.message.reply_text(f"Saved: {goal} → “{why}”. Use /checkin to start.")
 
+async def cmd_checkintime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not context.args:
+        return await update.message.reply_text("Usage: /checkintime <hour 0-23>")
+    try:
+        hour = int(context.args[0])
+        if not (0 <= hour <= 23):
+            raise ValueError()
+    except ValueError:
+        return await update.message.reply_text("Enter an hour 0–23.")
+    users.update_one({"user_id": user.id}, {"$set": {"checkin_hour": hour}}, upsert=True)
+    await update.message.reply_text(f"Daily check-in set to {hour:02d}:00 {TZ}.")
 
-
-async def set_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /schedule <day> <start-end> or 'off'\nExample: /schedule mon 10:00-18:00")
-        return
-
-    day = context.args[0].lower()[:3]
-    time_range = context.args[1].lower()
-
-    schedule = load_schedule()
-
-    if time_range == "off":
-        schedule[day] = "off"
-        save_schedule(schedule)
-        await update.message.reply_text(f"📅 Schedule updated: {day.title()} is now a day off.")
-    else:
-        try:
-            start, end = time_range.split("-")
-            # Optional: Validate format here
-            schedule[day] = f"{start}-{end}"
-            save_schedule(schedule)
-            await update.message.reply_text(f"📅 Schedule updated: {day.title()} → {start} to {end}")
-        except ValueError:
-            await update.message.reply_text("Time format should be like 10:00-18:00")
-
-async def show_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    schedule = load_schedule()
-    msg = "📅 Your Weekly Schedule:\n"
-    for day in ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]:
-        entry = schedule.get(day, "Not set")
-        msg += f"{day.title()}: {entry}\n"
-    await update.message.reply_text(msg)
-
-
-
-async def apicount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    count = api_call_count.get("cohere", 0)
-    await update.message.reply_text(f"🧠 Cohere API calls used: {count}")
-
-
-
-async def midday_goal_reminder(application):
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
-    goal = get_goal()
-
-    if goal:
-      await bot.send_message(
-        chat_id=CHAT_ID,
-        text=f"⏰ Midday Reminder! Your goal today is: '{goal}' Are you working on it? Let’s lock in 🔒"
-    )
-
-            
-            
-    else:
-        await bot.send_message(
-            chat_id=CHAT_ID,
-            text="⏰ Midday Reminder! You haven't set a goal for today yet. Use /goal to set one!"
-        )
-
-
-
-def get_streak():
-    today = datetime.date.today()
-    streak = 0
-    for i in range(7):
-        day = today - datetime.timedelta(days=i)
-        doc = goals_col.find_one({"date": day.isoformat()})
-        if doc and doc.get("done") is True:
-            streak += 1
-        else:
-            break
-    return streak
-
-
-def get_weekly_chart():
-    today = datetime.date.today()
-    emojis = []
-    for i in range(6, -1, -1):
-        day = today - datetime.timedelta(days=i)
-        doc = goals_col.find_one({"date": day.isoformat()})
-        if doc and doc.get("done") is True:
-            emojis.append("✅")
-        else:
-            emojis.append("❌")
-    return " ".join(emojis)
-
-
-
-
-def get_badge(streak):
-    if streak >= 30:
-        return "🏆 Platinum Crown – Rushabh Mode: Unstoppable 👑"
-    elif streak >= 14:
-        return "🔥 Flame Badge – Certified focused beast"
-    elif streak >= 7:
-        return "🥇 Gold Badge – You're locked in, legend"
-    elif streak >= 4:
-        return "🥈 Silver Badge – Building momentum"
-    elif streak >= 1:
-        return "🥉 Bronze Badge – Getting warmed up"
-    else:
-        return "😴 No Badge Yet – Time to start a streak!"
-
-
-async def streak(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    streak = get_streak()
-    chart = get_weekly_chart()
+async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    ensure_user(user.id, user.full_name or "")
+    g = get_first_goal(user.id)
+    if not g:
+        return await update.message.reply_text("Set a goal first: /setgoal <goal> <why>")
+    state.update_one({"user_id": user.id}, {"$set": {"last_checkin": now()}}, upsert=True)
     await update.message.reply_text(
-    f"🔥 Current Streak: {streak} days in a row!\n\n📈 Weekly Progress:\n{chart}"
-)
+        f"Check-in for **{g['goal']}**. How are you right now?",
+        reply_markup=mood_buttons(),
+        parse_mode="Markdown",
+    )
+    log_event(user.id, "checkin", {"goal": g["goal"], "manual": True})
 
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    u = users.find_one({"user_id": user.id}) or {}
+    s = state.find_one({"user_id": user.id}) or {}
+    gcount = goals.count_documents({"user_id": user.id})
+    streak = u.get("streak", 0)
+    missed = u.get("missed_days", 0)
+    last10 = list(logs.find({"user_id": user.id}).sort("ts", DESCENDING).limit(10))
+    lines = [
+        f"Goals: {gcount} | Streak: {streak} | MissedDays: {missed}",
+        f"Last mood: {s.get('mood') or 'n/a'} | Cooldown: {'on' if cooldown_active(user.id) else 'off'}",
+        "Recent:"
+    ]
+    for L in last10:
+        t = L["ts"].astimezone(TZINFO).strftime("%b %d %H:%M")
+        lines.append(f"• {t} – {L['kind']}")
+    await update.message.reply_text("\n".join(lines))
 
+async def cmd_override(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    g = get_first_goal(user.id)
+    if not g:
+        return await update.message.reply_text("Set a goal first: /setgoal <goal> <why>")
+    await run_override(user.id, g["goal"], context)
 
+# =========================
+# CALLBACKS
+# =========================
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    data = query.data
 
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today = datetime.date.today()
-    messages = []
-    for i in range(6, -1, -1):
-        day = today - datetime.timedelta(days=i)
-        date_str = day.strftime("%a %d %b")
-        doc = goals_col.find_one({"date": day.isoformat()})
-        status = "✅" if doc and doc.get("done") else "❌"
-        goal_text = doc.get("goal", "No goal") if doc else "No goal"
-        messages.append(f"{status} {date_str}: {goal_text}")
-    await update.message.reply_text("🗓️ Goal History (Last 7 Days):\n" + "\n".join(messages))
-
-
-
-async def passive_check(application):
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
-    goal = get_goal()
-
-    if not goal:
-        await bot.send_message(
-            chat_id=CHAT_ID,
-            text="👀 You haven’t set a goal in a while. What’s the move, boss? Use /goal to lock one in."
-        )
-
-
-async def weekly_report(application):
-    if is_paused():
+    # Mood selected
+    if data.startswith("mood:"):
+        mood = data.split(":")[1]
+        state.update_one({"user_id": user.id}, {"$set": {"mood": mood}}, upsert=True)
+        g = get_first_goal(user.id)
+        udoc = users.find_one({"user_id": user.id}) or {}
+        tone = get_tone(udoc)
+        step = tiny_steps(mood, g["goal"])
+        why = get_why(user.id, g["goal"])
+        msg = style_text(tone, f"{step}\n\nYour why: “{why or '—'}”.")
+        await query.edit_message_text(msg, reply_markup=action_buttons(g["goal"]))
+        log_event(user.id, "mood", {"mood": mood})
         return
 
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
+    # Done
+    if data.startswith("done:"):
+        goal = data.split(":")[1]
+        bump_streak(user.id, 1)
+        udoc = users.find_one({"user_id": user.id}) or {}
+        line = praise_line(udoc.get("streak", 0))
+        log_event(user.id, "done", {"goal": goal})
+        await query.edit_message_text(f"✅ Logged: {goal}. {line}")
+        return
 
-    goals_completed = 0
-    lazy_days = 0
+    # Skip → friction + ask reason
+    if data.startswith("skip:"):
+        goal = data.split(":")[1]
+        set_cooldown(user.id, minutes=10)
+        bump_missed(user.id, 1)
+        log_event(user.id, "skip", {"goal": goal})
+        await query.edit_message_text(
+            "Skip noted. Entertainment cooldown: 10 min.\nWhat’s the reason?",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="cancel_reason")]])
+        )
+        context.user_data["awaiting_reason_for"] = goal
+        return
 
-    today = datetime.date.today()
+    if data == "cancel_reason":
+        context.user_data.pop("awaiting_reason_for", None)
+        await query.edit_message_text("Reason entry canceled.")
+        return
 
-    for i in range(7):
-        day = today - datetime.timedelta(days=i)
-        day_str = day.isoformat()
+    # Emergency override
+    if data.startswith("override:"):
+        goal = data.split(":")[1]
+        await run_override(user.id, goal, context)
+        await query.edit_message_text("Override initiated. Check your chat.")
+        return
 
-        
+# Collect reason text after skip
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    txt = (update.message.text or "").strip()
 
-        # Goal check (we assume if mood was logged, day was active)
-        goal_doc = goals_col.find_one({"date": day_str})
-        if goal_doc and goal_doc.get("done") is True:
-            goals_completed += 1
+    # Cooldown gate
+    if cooldown_active(user.id):
+        return await update.message.reply_text("Cooldown active. Back to work; try again later.", reply_markup=ReplyKeyboardRemove())
 
-    
+    if "awaiting_reason_for" in context.user_data:
+        goal = context.user_data.pop("awaiting_reason_for")
+        logs.insert_one({
+            "user_id": user.id, "ts": now(), "kind": "reason",
+            "data": {"goal": goal, "reason": txt}
+        })
+        why = get_why(user.id, goal)
+        nudge = f"You said “{why or '—'}”. Is this reason stronger than that?\nNext tiny step: {tiny_steps('distracted', goal)}"
+        return await update.message.reply_text(nudge)
 
-    report = f"""📊 Weekly Report – {today.strftime('%B %d, %Y')}
+    # Fallback small coach via Cohere
+    g = get_first_goal(user.id)
+    goal = g["goal"] if g else "—"
+    prompt = (
+        f"User said: '{txt}'.\n"
+        f"Current focus goal: '{goal}'.\n"
+        "Reply as a concise, no-nonsense accountability coach. Offer a smallest next step."
+    )
+    reply = ai_reply(prompt)
+    await update.message.reply_text(reply)
 
-✅ Goals completed: {goals_completed}/7  
-😐 Lazy/no-goal days: {lazy_days}  
+# =========================
+# EMERGENCY OVERRIDE
+# =========================
+async def run_override(user_id, goal, context: ContextTypes.DEFAULT_TYPE):
+    step1 = "Grounding: 6 cycles — inhale 4, hold 4, exhale 6. Drink water. Stand up and shake arms."
+    why = get_why(user_id, goal) or "—"
+    step2 = f"Your why: “{why}”."
+    step3 = f"Smallest action: open the tool. If {goal == 'code'} → open VS Code; if gym → put on shoes. 90-second rule."
+    log_event(user_id, "override", {"goal": goal})
+    await context.bot.send_message(chat_id=user_id, text=f"{step1}\n\n{step2}\n\n{step3}")
 
+# =========================
+# SCHEDULED JOBS
+# =========================
+async def job_daily_checkins(app):
+    # Runs hourly; messages only at each user's chosen hour
+    now_local = now()
+    for u in users.find({}):
+        if u.get("checkin_hour", 8) == now_local.hour:
+            g = get_first_goal(u["user_id"])
+            if not g:
+                continue
+            try:
+                await app.bot.send_message(
+                    chat_id=u["user_id"],
+                    text=f"Daily check-in for **{g['goal']}**. How are you right now?",
+                    reply_markup=mood_buttons(),
+                    parse_mode="Markdown",
+                )
+                log_event(u["user_id"], "checkin", {"goal": g["goal"], "auto": True})
+            except Exception:
+                pass
 
-Let’s aim even higher next week, king 👑
-"""
+async def job_weekly_insights(app):
+    one_week = now() - timedelta(days=7)
+    for u in users.find({}):
+        uid = u["user_id"]
+        week = list(logs.find({"user_id": uid, "ts": {"$gte": one_week}}))
+        done = sum(1 for L in week if L["kind"] == "done")
+        skip = sum(1 for L in week if L["kind"] == "skip")
+        mood_counts = {}
+        for L in week:
+            if L["kind"] == "mood":
+                m = (L["data"] or {}).get("mood")
+                if m:
+                    mood_counts[m] = mood_counts.get(m, 0) + 1
+        top_mood = max(mood_counts, key=mood_counts.get) if mood_counts else "n/a"
 
-    await bot.send_message(chat_id=CHAT_ID, text=report)
+        msg = (
+            "📊 Weekly Insight\n"
+            f"• Done: {done} | Skips: {skip}\n"
+            f"• Most frequent state: {top_mood}\n"
+            "• Suggestion: stack your hardest task right after your natural energy peak.\n"
+            "Reply /stats for last events."
+        )
+        try:
+            await app.bot.send_message(chat_id=uid, text=msg)
+            log_event(uid, "insight", {"done": done, "skip": skip, "top_mood": top_mood})
+        except Exception:
+            pass
 
-
-
-
-# MAIN FUNCTION
-
-def reset_api_counter():
-    global api_call_count
-    api_call_count["cohere"] = 0
-
-
-if __name__ == '__main__':
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_checkin_response))
-    app.add_handler(CommandHandler("pause", pause))
-    app.add_handler(CommandHandler("resume", resume))
-    app.add_handler(CommandHandler("goal", set_goal))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("schedule", set_schedule))
-    app.add_handler(CommandHandler("showschedule", show_schedule))
-    app.add_handler(CommandHandler("streak", streak))
-    app.add_handler(CommandHandler("history", history))
-    app.add_handler(CommandHandler("apicount", apicount))
-
-
-
-
-
-
-    # Set up daily scheduler
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(lambda: asyncio.run(send_morning_message(app)), 'cron', hour=9, minute=00, timezone=toronto)
-    # 9:05 AM - ask for goal
-    scheduler.add_job(lambda: asyncio.run(ask_daily_goal(app)), 'cron', hour=9, minute=5, timezone=toronto)
-
-
-
-    # 10:30 PM - ask if goal was completed
-    scheduler.add_job(lambda: asyncio.run(ask_goal_completion(app)), 'cron', hour=22, minute=30, timezone=toronto)
+# =========================
+# APP WIRING
+# =========================
+async def on_start(app):
+    scheduler = AsyncIOScheduler(timezone=TZ)
+    # Hourly tick → per-user check-in at their hour
+    scheduler.add_job(lambda: job_daily_checkins(app), "cron", minute=0)
+    # Weekly insights: Sunday 18:00 local
+    scheduler.add_job(lambda: job_weekly_insights(app), "cron", day_of_week="sun", hour=18, minute=0)
     scheduler.start()
 
-    scheduler.add_job(
-    lambda: asyncio.run(weekly_report(app)),
-    'cron',
-    day_of_week='sun',
-    hour=9,
-    minute=0,
-    timezone=toronto
-    )
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-for hour in [11, 13, 15, 17, 19]:  # Adjust these times if needed
-    scheduler.add_job(
-        lambda: asyncio.run(send_checkin(app)),
-        'cron',
-        hour=hour,
-        minute=0,
-        timezone=toronto
-    )
-    
-    scheduler.add_job(
-        lambda: asyncio.run(passive_check(app)),
-        trigger="interval",
-        hours=5
-)
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("setgoal", cmd_setgoal))
+    app.add_handler(CommandHandler("checkintime", cmd_checkintime))
+    app.add_handler(CommandHandler("checkin", cmd_checkin))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("override", cmd_override))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
-    scheduler.add_job(
-        lambda: asyncio.run(midday_goal_reminder(app)),
-        trigger='cron',
-        hour=13,
-        minute=30,
-        timezone=toronto
-)
-
-
-    
-    scheduler.add_job(
-        reset_api_counter,
-        'cron',
-        day=1,
-        hour=0,
-        minute=0,
-        timezone=toronto
-)
-
-
-
-    print("BRBot is running with scheduled morning message... 🌞")
+    app.post_init = on_start
     app.run_polling()
+
+if __name__ == "__main__":
+    main()
