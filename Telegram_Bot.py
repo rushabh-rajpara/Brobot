@@ -424,9 +424,12 @@ tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
 @app.on_event("startup")
 async def on_startup():
-    # No polling here; FastAPI receives updates and feeds tg_app
-    pass
-
+     await tg_app.initialize() 
+    
+@app.on_event("shutdown")
+async def on_shutdown():
+    await tg_app.shutdown()   
+    
 @app.get("/health")
 async def health():
     return PlainTextResponse("ok")
