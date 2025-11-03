@@ -356,24 +356,30 @@ async def run_override(user_id: int, goal: str, context: ContextTypes.DEFAULT_TY
 # =========================
 # CRON TASKS (hit by Cloudflare Cron)
 # =========================
+
+def _hour_bucket(dt_utc): return dt_utc.strftime("%Y-%m-%dT%H")
+
 async def cron_daily(app: Application):
     """Send check-ins to users at their chosen hour."""
-    now_local = now()
+    now_utc = dt.datetime.now(dt.timezone.utc)
     for u in users.find({}):
-        if u.get("checkin_hour", 8) == now_local.hour:
+        try:
+            local_hour = now_utc.astimezone(ZoneInfo(u.get("tz", TZ))).hour
+            if local_hour != u.get("checkin_hour", 8):
+                continue
+            bucket = _hour_bucket(now_utc)
+            if u.get("last_daily_sent") == bucket:
+                continue
             g = get_first_goal(u["user_id"])
             if not g:
                 continue
-            try:
-                await app.bot.send_message(
-                    chat_id=u["user_id"],
-                    text=f"Daily check-in for **{g['goal']}**. How are you right now?",
-                    reply_markup=mood_buttons(),
-                    parse_mode="Markdown",
-                )
-                log_event(u["user_id"], "checkin", {"goal": g["goal"], "auto": True})
-            except Exception:
-                pass
+            await app.bot.send_message(u["user_id"],
+            text=f"Daily check-in for **{g['goal']}**. How are you right now?",
+            reply_markup=mood_buttons(), parse_mode="Markdown")
+            users.update_one({"user_id": u["user_id"]}, {"$set": {"last_daily_sent": bucket}})
+            log_event(u["user_id"], "checkin", {"goal": g["goal"], "auto": True})
+        except Exception:
+            pass
 
 async def cron_weekly(app: Application):
     """Send weekly insight summary."""
