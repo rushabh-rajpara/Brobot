@@ -48,12 +48,16 @@ users = db["users"]    # {user_id, name, streak, missed_days, checkin_hour, crea
 goals = db["goals"]    # {user_id, goal, why, updated_at}
 logs = db["logs"]      # {user_id, ts, kind, data}
 state = db["state"]    # {user_id, mood, energy, focus, cooldown_until, last_checkin}
+sessions = db["sessions"]  # { user_id, goal, state, timebox_min, started_at, ends_at, evidence_score, last_nudge_at, created_at }
+events   = db["events"]    # optional: raw passive events you’ll ingest later
 
 # Indexes
 users.create_index([("user_id", ASCENDING)], unique=True)
 goals.create_index([("user_id", ASCENDING), ("goal", ASCENDING)], unique=True)
 logs.create_index([("user_id", ASCENDING), ("ts", DESCENDING)])
 state.create_index([("user_id", ASCENDING)], unique=True)
+sessions.create_index([("user_id", ASCENDING), ("state", ASCENDING), ("started_at", DESCENDING)])
+events.create_index([("user_id", ASCENDING), ("ts", DESCENDING)])
 
 # =========================
 # UTIL
@@ -86,6 +90,46 @@ def ensure_user(user_id: int, name: str):
         }},
         upsert=True
     )
+
+def get_current_goal(user_id: int):
+    """Use active goal if you added that feature; otherwise fallback to first goal."""
+    try:
+        # If you implemented active-goal helpers, prefer them:
+        g = goals.find_one({"user_id": user_id, "goal": (users.find_one({"user_id": user_id}) or {}).get("active_goal")})
+        if g:
+            return g
+    except Exception:
+        pass
+    return get_first_goal(user_id)
+
+def start_session(user_id: int, timebox_min: int, goal: str | None = None) -> str:
+    g = goal or ((get_current_goal(user_id) or {}).get("goal"))
+    if not g:
+        raise ValueError("No goal set for user.")
+    ends = now() + timedelta(minutes=timebox_min)
+    doc = {
+        "user_id": user_id,
+        "goal": g,
+        "state": "ACTIVE",  # PLANNED|ACTIVE|DONE|TIMEOUT|ABORTED
+        "timebox_min": int(timebox_min),
+        "started_at": now(),
+        "ends_at": ends,
+        "evidence_score": 0.0,
+        "last_nudge_at": None,
+        "created_at": now(),
+    }
+    res = sessions.insert_one(doc)
+    log_event(user_id, "session_start", {"goal": g, "timebox_min": timebox_min, "sid": str(res.inserted_id)})
+    return str(res.inserted_id)
+
+def finish_latest_session(user_id: int, state: str = "DONE") -> bool:
+    """Mark the most recent ACTIVE session as DONE/TIMEOUT/ABORTED."""
+    s = sessions.find_one({"user_id": user_id, "state": "ACTIVE"}, sort=[("started_at", DESCENDING)])
+    if not s:
+        return False
+    sessions.update_one({"_id": s["_id"]}, {"$set": {"state": state, "ends_at": now()}})
+    log_event(user_id, "session_finish", {"sid": str(s["_id"]), "to": state})
+    return True
 
 def get_tone(user_doc: Dict[str, Any]) -> str:
     streak = user_doc.get("streak", 0)
@@ -230,6 +274,28 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "See progress: /stats"
     )
     await update.message.reply_text(msg)
+
+# === PHASE 0: /focus command ===
+async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    ensure_user(user.id, user.full_name or user.username or "human")
+    if not context.args:
+        return await update.message.reply_text("Usage: /focus <minutes>  (e.g., /focus 25)")
+    try:
+        mins = int(context.args[0])
+        if mins <= 0 or mins > 240:
+            raise ValueError()
+    except ValueError:
+        return await update.message.reply_text("Enter a valid number of minutes (1–240).")
+    g = get_current_goal(user.id)
+    if not g:
+        return await update.message.reply_text("Set a goal first: /setgoal <goal> <why>")
+    try:
+        sid = start_session(user.id, mins, g["goal"])
+    except Exception as e:
+        return await update.message.reply_text(f"Could not start session: {e}")
+    end_local = (now() + timedelta(minutes=mins)).astimezone(TZINFO).strftime("%H:%M")
+    await update.message.reply_text(f"🎯 Focus session started for **{g['goal']}** — {mins} min. Ends ~{end_local}.", parse_mode="Markdown")
 
 async def cmd_setgoal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -488,6 +554,8 @@ tg_app.add_handler(CommandHandler("stats", cmd_stats))
 tg_app.add_handler(CommandHandler("override", cmd_override))
 tg_app.add_handler(CommandHandler("setactive", cmd_setactive))
 tg_app.add_handler(CommandHandler("goals", cmd_goals))
+tg_app.add_handler(CommandHandler("focus", cmd_focus))
+
 tg_app.add_handler(CallbackQueryHandler(on_callback))
 tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
@@ -539,3 +607,57 @@ async def cron_weekly_endpoint(request: Request):
     _check_cron_auth(request)
     await cron_weekly(tg_app)
     return PlainTextResponse("weekly-ok")
+
+# === PHASE 0: simple API (protected by ?secret=CRON_SECRET) ===
+def _require_api_secret(req: Request):
+    if not CRON_SECRET:
+        raise HTTPException(status_code=503, detail="API secret not configured")
+    if req.query_params.get("secret") != CRON_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+
+@app.post("/sessions/start")
+async def api_sessions_start(request: Request):
+    _require_api_secret(request)
+    data = await request.json()
+    try:
+        user_id = int(data.get("user_id"))
+        timebox_min = int(data.get("timebox_min", 25))
+        goal = (data.get("goal") or None)
+    except Exception:
+        raise HTTPException(status_code=400, detail="user_id and timebox_min are required")
+    ensure_user(user_id, "api")
+    try:
+        sid = start_session(user_id, timebox_min, goal)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"{e}")
+    return {"ok": True, "session_id": sid}
+
+@app.post("/sessions/finish")
+async def api_sessions_finish(request: Request):
+    _require_api_secret(request)
+    data = await request.json()
+    user_id = int(data.get("user_id"))
+    state = data.get("state", "DONE")
+    if state not in ("DONE", "TIMEOUT", "ABORTED"):
+        raise HTTPException(status_code=400, detail="state must be DONE|TIMEOUT|ABORTED")
+    ok = finish_latest_session(user_id, state=state)
+    return {"ok": ok}
+
+@app.post("/events")
+async def api_events(request: Request):
+    """Phase-0 event ingest (we'll use it in Phase-1)."""
+    _require_api_secret(request)
+    data = await request.json()
+    # expected: { user_id, kind, value, ts? }
+    try:
+        uid = int(data["user_id"])
+        kind = str(data["kind"])
+        value = data.get("value")
+    except Exception:
+        raise HTTPException(status_code=400, detail="user_id and kind required")
+    ts = data.get("ts")
+    ts_dt = now() if not ts else dt.datetime.fromisoformat(ts)
+    events.insert_one({"user_id": uid, "kind": kind, "value": value, "ts": ts_dt})
+    # mirror into logs for visibility
+    log_event(uid, "event", {"kind": kind, "value": value})
+    return {"ok": True}
