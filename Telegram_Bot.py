@@ -6,6 +6,8 @@ import datetime as dt
 from datetime import timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, Any
+from pymongo.errors import PyMongoError
+
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -490,8 +492,13 @@ tg_app.add_handler(CallbackQueryHandler(on_callback))
 tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
 @app.on_event("startup")
-async def on_startup():
-     await tg_app.initialize() 
+async def verify_dependencies():
+    await tg_app.initialize()
+    try:
+        mongo.admin.command("ping")
+        print("[startup] Mongo ok")
+    except PyMongoError as e:
+        raise RuntimeError(f"Mongo ping failed: {e}")
     
 @app.on_event("shutdown")
 async def on_shutdown():
