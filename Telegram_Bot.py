@@ -189,6 +189,29 @@ def praise_line(streak: int) -> str:
         options += ["Certified menace to procrastination.", "Your future self is slow-clapping."]
     return random.choice(options)
 
+def get_active_goal(user_id: int):
+    u = users.find_one({"user_id": user_id}) or {}
+    active = u.get("active_goal")
+    if active:
+        g = goals.find_one({"user_id": user_id, "goal": active})
+        if g: 
+            return g
+    return goals.find_one({"user_id": user_id})  # fallback
+
+def set_active_goal(user_id: int, goal: str) -> bool:
+    g = goals.find_one({"user_id": user_id, "goal": goal})
+    if not g:
+        return False
+    users.update_one({"user_id": user_id}, {"$set": {"active_goal": goal}}, upsert=True)
+    return True
+
+def goals_list_buttons(user_id: int):
+    items = list(goals.find({"user_id": user_id}))
+    rows = []
+    for g in items:
+        rows.append([InlineKeyboardButton(f"Set active: {g['goal']}", callback_data=f"active:{g['goal']}")])
+    return InlineKeyboardMarkup(rows or [[InlineKeyboardButton("No goals set", callback_data="noop")]])
+
 # =========================
 # TELEGRAM HANDLERS
 # =========================
@@ -214,8 +237,33 @@ async def cmd_setgoal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     goal = context.args[0].lower()
     why = " ".join(context.args[1:])
     set_goal_why(user.id, goal, why)
+    # set active if none exists
+    u = users.find_one({"user_id": user.id}) or {}
+    if not u.get("active_goal"):
+        users.update_one({"user_id": user.id}, {"$set": {"active_goal": goal}}, upsert=True)
     log_event(user.id, "why", {"goal": goal})
-    await update.message.reply_text(f"Saved: {goal} → “{why}”. Use /checkin to start.")
+    await update.message.reply_text(f"Saved: {goal} → “{why}”. Active goal: {goal}. Use /checkin to start.")
+
+async def cmd_setactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    ensure_user(user.id, user.full_name or "")
+    if not context.args:
+        return await update.message.reply_text("Usage: /setactive <goal>")
+    goal = context.args[0].lower()
+    ok = set_active_goal(user.id, goal)
+    if not ok:
+        return await update.message.reply_text(f"No such goal: {goal}. Use /goals to see yours.")
+    await update.message.reply_text(f"Active goal set to: {goal}")
+
+async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    items = list(goals.find({"user_id": user.id}))
+    if not items:
+        return await update.message.reply_text("No goals yet. Add one: /setgoal <goal> <why>")
+    u = users.find_one({"user_id": user.id}) or {}
+    active = u.get("active_goal")
+    lst = "\n".join([f"• {g['goal']}" + ("  ← active" if g['goal']==active else "") for g in items])
+    await update.message.reply_text(f"Your goals:\n{lst}", reply_markup=goals_list_buttons(user.id))
 
 async def cmd_checkintime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -233,7 +281,7 @@ async def cmd_checkintime(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.full_name or "")
-    g = get_first_goal(user.id)
+    g = get_active_goal(user.id)
     if not g:
         return await update.message.reply_text("Set a goal first: /setgoal <goal> <why>")
     state.update_one({"user_id": user.id}, {"$set": {"last_checkin": now()}}, upsert=True)
@@ -243,6 +291,7 @@ async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
     log_event(user.id, "checkin", {"goal": g["goal"], "manual": True})
+
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -317,6 +366,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await run_override(user.id, goal, context)
         await query.edit_message_text("Override initiated. Check your chat.")
         return
+    
+    # Set active goal from inline button
+    if data.startswith("active:"):
+        goal = data.split(":")[1]
+        if set_active_goal(user.id, goal):
+            await query.edit_message_text(f"Active goal set to: {goal}")
+        else:
+            await query.edit_message_text("Could not set active goal.")
+        return
+
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -425,6 +484,8 @@ tg_app.add_handler(CommandHandler("checkintime", cmd_checkintime))
 tg_app.add_handler(CommandHandler("checkin", cmd_checkin))
 tg_app.add_handler(CommandHandler("stats", cmd_stats))
 tg_app.add_handler(CommandHandler("override", cmd_override))
+tg_app.add_handler(CommandHandler("setactive", cmd_setactive))
+tg_app.add_handler(CommandHandler("goals", cmd_goals))
 tg_app.add_handler(CallbackQueryHandler(on_callback))
 tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
