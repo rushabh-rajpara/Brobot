@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, Any
 from pymongo.errors import PyMongoError
+from bson import ObjectId
 
 
 from fastapi import FastAPI, Request, HTTPException
@@ -110,7 +111,7 @@ def get_current_goal(user_id: int):
         pass
     return get_first_goal(user_id)
 
-def start_session(user_id: int, timebox_min: int, goal: str | None = None) -> str:
+def start_session(user_id: int, timebox_min: int, goal: str | None = None) -> ObjectId:
     g = goal or ((get_current_goal(user_id) or {}).get("goal"))
     if not g:
         raise ValueError("No goal set for user.")
@@ -125,10 +126,17 @@ def start_session(user_id: int, timebox_min: int, goal: str | None = None) -> st
         "evidence_score": 0.0,
         "last_nudge_at": None,
         "created_at": now(),
+        # Phase 1 fields defaulted here so they always exist
+        "started_confirmed": False,
+        "nudges_sent": 0,
+        "next_check_at": None,
+        "asked_completion": False,
+        "positive_minutes": 0,
     }
     res = sessions.insert_one(doc)
-    log_event(user_id, "session_start", {"goal": g, "timebox_min": timebox_min, "sid": str(res.inserted_id)})
-    return str(res.inserted_id)
+    sid = res.inserted_id
+    log_event(user_id, "session_start", {"goal": g, "timebox_min": timebox_min, "sid": str(sid)})
+    return sid
 
 def finish_latest_session(user_id: int, state: str = "DONE") -> bool:
     """Mark the most recent ACTIVE session as DONE/TIMEOUT/ABORTED."""
@@ -295,27 +303,22 @@ async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise ValueError()
     except ValueError:
         return await update.message.reply_text("Enter a valid number of minutes (1–240).")
+
     g = get_current_goal(user.id)
     if not g:
         return await update.message.reply_text("Set a goal first: /setgoal <goal> <why>")
+
     try:
         sid = start_session(user.id, mins, g["goal"])
-        sessions.update_one(
-            {"_id": sessions.find_one({"_id": sessions._BaseObject__codec_options.document_class(sid)})["_id"]} if False else {"_id": sessions.find_one({"user_id": user.id, "state": "ACTIVE"}, sort=[("started_at", DESCENDING)])["_id"]},
-            {"$set": {
-                "started_confirmed": False,
-                "nudges_sent": 0,
-                "next_check_at": now() + timedelta(minutes=5),
-                "asked_completion": False,
-                "positive_minutes": 0,
-            }}
-        )
+        sessions.update_one({"_id": sid}, {"$set": {"next_check_at": now() + timedelta(minutes=5)}})
     except Exception as e:
         return await update.message.reply_text(f"Could not start session: {e}")
+
     end_local = (now() + timedelta(minutes=mins)).astimezone(TZINFO).strftime("%H:%M")
     await update.message.reply_text(
         f"🎯 Focus session started for **{g['goal']}** — {mins} min. Ends ~{end_local}.\n"
-        f"I’ll check in at +5 min.", parse_mode="Markdown"
+        f"I’ll check in at +5 min.",
+        parse_mode="Markdown"
     )
 
 async def cmd_setgoal(update: Update, context: ContextTypes.DEFAULT_TYPE):
