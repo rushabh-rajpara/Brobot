@@ -3,7 +3,7 @@ import os
 import random
 import asyncio
 import datetime as dt
-from datetime import timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, Any
 from pymongo.errors import PyMongoError
@@ -50,6 +50,14 @@ logs = db["logs"]      # {user_id, ts, kind, data}
 state = db["state"]    # {user_id, mood, energy, focus, cooldown_until, last_checkin}
 sessions = db["sessions"]  # { user_id, goal, state, timebox_min, started_at, ends_at, evidence_score, last_nudge_at, created_at }
 events   = db["events"]    # optional: raw passive events you’ll ingest later
+
+started_confirmed: bool
+nudges_sent: int
+next_check_at: datetime
+asked_completion: bool
+positive_minutes: int
+
+
 
 # Indexes
 users.create_index([("user_id", ASCENDING)], unique=True)
@@ -275,7 +283,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg)
 
-# === PHASE 0: /focus command ===
+# === /focus command ===
 async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.full_name or user.username or "human")
@@ -292,10 +300,23 @@ async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Set a goal first: /setgoal <goal> <why>")
     try:
         sid = start_session(user.id, mins, g["goal"])
+        sessions.update_one(
+            {"_id": sessions.find_one({"_id": sessions._BaseObject__codec_options.document_class(sid)})["_id"]} if False else {"_id": sessions.find_one({"user_id": user.id, "state": "ACTIVE"}, sort=[("started_at", DESCENDING)])["_id"]},
+            {"$set": {
+                "started_confirmed": False,
+                "nudges_sent": 0,
+                "next_check_at": now() + timedelta(minutes=5),
+                "asked_completion": False,
+                "positive_minutes": 0,
+            }}
+        )
     except Exception as e:
         return await update.message.reply_text(f"Could not start session: {e}")
     end_local = (now() + timedelta(minutes=mins)).astimezone(TZINFO).strftime("%H:%M")
-    await update.message.reply_text(f"🎯 Focus session started for **{g['goal']}** — {mins} min. Ends ~{end_local}.", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"🎯 Focus session started for **{g['goal']}** — {mins} min. Ends ~{end_local}.\n"
+        f"I’ll check in at +5 min.", parse_mode="Markdown"
+    )
 
 async def cmd_setgoal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -443,6 +464,48 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("Could not set active goal.")
         return
+    
+        # === PHASE 1: session callback handlers ===
+    if data == "sess:start_yes":
+        s = sessions.find_one({"user_id": user.id, "state": "ACTIVE"}, sort=[("started_at", DESCENDING)])
+        if s:
+            sessions.update_one({"_id": s["_id"]}, {"$set": {"started_confirmed": True, "next_check_at": now() + timedelta(minutes=15)}})
+        await query.edit_message_text("Locked in. Next check at +15. Keep swinging. 🔥")
+        return
+
+    if data == "sess:start_no":
+        s = sessions.find_one({"user_id": user.id, "state": "ACTIVE"}, sort=[("started_at", DESCENDING)])
+        if s:
+            sessions.update_one({"_id": s["_id"]}, {"$set": {"next_check_at": now() + timedelta(minutes=5)}})
+        await query.edit_message_text("No shame—start the tiniest step. Timer in 5. ⏱️")
+        return
+
+    if data == "sess:still_yes":
+        s = sessions.find_one({"user_id": user.id, "state": "ACTIVE"}, sort=[("started_at", DESCENDING)])
+        if s:
+            sessions.update_one({"_id": s["_id"]}, {"$set": {"next_check_at": now() + timedelta(minutes=15)}})
+        await query.edit_message_text("Nice—momentum > motivation. I’ll ping later. ⚡")
+        return
+
+    if data == "sess:still_no":
+        s = sessions.find_one({"user_id": user.id, "state": "ACTIVE"}, sort=[("started_at", DESCENDING)])
+        if s:
+            sessions.update_one({"_id": s["_id"]}, {"$set": {"next_check_at": now() + timedelta(minutes=5)}})
+        await query.edit_message_text("Reset the board: one micro-task, 5-min timer. You’ve got this. 🔁")
+        return
+
+    if data == "sess:complete_yes":
+        ok = finish_latest_session(user.id, state="DONE")
+        await query.edit_message_text("🏁 Session marked done. Save the win and breathe. 🙌")
+        return
+
+    if data == "sess:complete_no":
+        s = sessions.find_one({"user_id": user.id, "state": "ACTIVE"}, sort=[("started_at", DESCENDING)])
+        if s:
+            sessions.update_one({"_id": s["_id"]}, {"$set": {"asked_completion": True, "next_check_at": now() + timedelta(minutes=5)}})
+        await query.edit_message_text("All good. 5 more minutes. Then we reassess. ⏳")
+        return
+
 
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -661,3 +724,68 @@ async def api_events(request: Request):
     # mirror into logs for visibility
     log_event(uid, "event", {"kind": kind, "value": value})
     return {"ok": True}
+
+# === PHASE 1: minute tick driving nudges & completion asks ===
+def _session_msg_goal_line(s): return f"**{s.get('goal','—')}**"
+
+async def cron_sessions_tick(app: Application):
+    now_utc = now()
+    # Look at ACTIVE sessions only
+    active = list(sessions.find({"state": "ACTIVE"}))
+    for s in active:
+        uid = s["user_id"]
+        # Ask completion when timebox is up (once)
+        if now_utc >= s.get("ends_at", now_utc) and not s.get("asked_completion", False):
+            try:
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Done", callback_data="sess:complete_yes"),
+                     InlineKeyboardButton("⏳ Not yet", callback_data="sess:complete_no")]
+                ])
+                await app.bot.send_message(uid, text=f"⏱️ Time’s up for {_session_msg_goal_line(s)}. Did you finish?", reply_markup=kb, parse_mode="Markdown")
+                sessions.update_one({"_id": s["_id"]}, {"$set": {"asked_completion": True}})
+            except Exception:
+                pass
+            continue
+
+        # If still within timebox, handle start/still-working checks
+        nca = s.get("next_check_at")
+        if not nca or now_utc < nca:
+            continue
+
+        nudges = int(s.get("nudges_sent", 0))
+        started = bool(s.get("started_confirmed", False))
+
+        # Build message tone (simple version; we’ll make it spicier later)
+        if not started:
+            txt = f"🔥 {_session_msg_goal_line(s)} — Did you start?"
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Yes, I started", callback_data="sess:start_yes"),
+                 InlineKeyboardButton("Not yet", callback_data="sess:start_no")]
+            ])
+            next_dt = now_utc + timedelta(minutes=5)  # keep pushing every 5 until started
+        else:
+            txt = f"⚡ {_session_msg_goal_line(s)} — Still in the pocket?"
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Still working", callback_data="sess:still_yes"),
+                 InlineKeyboardButton("I drifted", callback_data="sess:still_no")]
+            ])
+            next_dt = now_utc + timedelta(minutes=15)  # rhythm checks
+
+        # Nudge cap to avoid spam (max 4)
+        if nudges >= 4 and started:
+            # Back off silently once they’re moving
+            sessions.update_one({"_id": s["_id"]}, {"$set": {"next_check_at": next_dt}})
+            continue
+
+        try:
+            await app.bot.send_message(uid, text=txt, reply_markup=kb, parse_mode="Markdown")
+            sessions.update_one({"_id": s["_id"]}, {"$set": {"next_check_at": next_dt}, "$inc": {"nudges_sent": 1}})
+        except Exception:
+            pass
+
+# Endpoint to trigger it (like your other cron endpoints)
+@app.get("/cron/sessions-tick")
+async def cron_sessions_tick_endpoint(request: Request):
+    _check_cron_auth(request)
+    await cron_sessions_tick(tg_app)
+    return PlainTextResponse("sessions-tick-ok")
