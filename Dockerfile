@@ -10,5 +10,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY Telegram_Bot.py .
 
-# Render sets PORT automatically; uvicorn listens on 0.0.0.0
-CMD ["uvicorn", "Telegram_Bot:app", "--host", "0.0.0.0", "--port", "10000"]
+# Render sets PORT automatically; default to 10000 for local container runs.
+CMD ["sh", "-c", "uvicorn Telegram_Bot:app --host 0.0.0.0 --port ${PORT:-10000}"]

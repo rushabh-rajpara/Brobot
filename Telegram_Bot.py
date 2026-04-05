@@ -3,6 +3,7 @@ import os
 import random
 import asyncio
 import datetime as dt
+import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, Any
@@ -30,10 +31,15 @@ MONGO_URI = os.getenv("MONGO_URI")
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 TZ = os.getenv("TZ", "America/Toronto")
 TZINFO = ZoneInfo(TZ)
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 # Security
 TELEGRAM_SECRET_TOKEN = os.getenv("TELEGRAM_SECRET_TOKEN")  # for webhook header validation
 CRON_SECRET = os.getenv("CRON_SECRET")                      # for /cron/* endpoints protection
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("brobot")
 
 if not (BOT_TOKEN and MONGO_URI and COHERE_API_KEY):
     raise RuntimeError("Missing one of BOT_TOKEN / MONGO_URI / COHERE_API_KEY")
@@ -630,9 +636,25 @@ async def verify_dependencies():
     await tg_app.initialize()
     try:
         mongo.admin.command("ping")
-        print("[startup] Mongo ok")
+        logger.info("Mongo ok")
     except PyMongoError as e:
         raise RuntimeError(f"Mongo ping failed: {e}")
+
+    webhook_base = (WEBHOOK_URL or RENDER_EXTERNAL_URL or "").rstrip("/")
+    if webhook_base:
+        webhook_url = f"{webhook_base}/webhook"
+        try:
+            await tg_app.bot.set_webhook(
+                url=webhook_url,
+                secret_token=TELEGRAM_SECRET_TOKEN or None,
+                allowed_updates=Update.ALL_TYPES,
+            )
+            logger.info("Webhook set to %s", webhook_url)
+        except Exception:
+            logger.exception("Failed to set webhook to %s", webhook_url)
+            raise
+    else:
+        logger.warning("WEBHOOK_URL/RENDER_EXTERNAL_URL not set; webhook was not auto-registered")
     
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -651,7 +673,11 @@ async def telegram_webhook(request: Request):
             raise HTTPException(status_code=401, detail="Invalid telegram secret token")
     data = await request.json()
     update = Update.de_json(data=data, bot=tg_app.bot)
-    await tg_app.process_update(update)
+    try:
+        await tg_app.process_update(update)
+    except Exception:
+        logger.exception("Failed to process Telegram update")
+        raise HTTPException(status_code=500, detail="Update processing failed")
     return JSONResponse({"status": "processed"})
 
 # Protected cron endpoints (hit these via Cloudflare Cron or any scheduler)
