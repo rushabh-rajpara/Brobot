@@ -174,6 +174,7 @@ def ai_reply(prompt: str) -> str:
         resp = co.chat(model="command-r-plus", message=prompt, temperature=0.2)
         return (resp.text or "").strip()
     except Exception:
+        logger.exception("Cohere chat failed")
         return prompt
 
 def cooldown_active(user_id: int) -> bool:
@@ -520,6 +521,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     txt = (update.message.text or "").strip()
+    logger.info("text_router received message from user_id=%s text=%r", user.id if user else None, txt)
 
     if cooldown_active(user.id):
         return await update.message.reply_text("Cooldown active. Back to work; try again later.")
@@ -543,6 +545,9 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     reply = ai_reply(prompt)
     await update.message.reply_text(reply)
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Telegram handler error", exc_info=context.error)
 
 async def run_override(user_id: int, goal: str, context: ContextTypes.DEFAULT_TYPE):
     step1 = "Grounding: 6 cycles — inhale 4, hold 4, exhale 6. Drink water. Stand up and shake arms."
@@ -630,6 +635,7 @@ tg_app.add_handler(CommandHandler("focus", cmd_focus))
 
 tg_app.add_handler(CallbackQueryHandler(on_callback))
 tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+tg_app.add_error_handler(on_error)
 
 @app.on_event("startup")
 async def verify_dependencies():
