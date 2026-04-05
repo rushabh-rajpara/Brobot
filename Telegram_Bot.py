@@ -80,6 +80,13 @@ events.create_index([("user_id", ASCENDING), ("ts", DESCENDING)])
 def now():
     return dt.datetime.now(TZINFO)
 
+def ensure_aware(ts: dt.datetime | None) -> dt.datetime | None:
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=TZINFO)
+    return ts
+
 def ensure_user(user_id: int, name: str):
     users.update_one(
         {"user_id": user_id},
@@ -179,7 +186,7 @@ def ai_reply(prompt: str) -> str:
 
 def cooldown_active(user_id: int) -> bool:
     s = state.find_one({"user_id": user_id}) or {}
-    cu = s.get("cooldown_until")
+    cu = ensure_aware(s.get("cooldown_until"))
     return cu is not None and now() < cu
 
 def set_cooldown(user_id: int, minutes: int = 10):
@@ -772,7 +779,8 @@ async def cron_sessions_tick(app: Application):
     for s in active:
         uid = s["user_id"]
         # Ask completion when timebox is up (once)
-        if now_utc >= s.get("ends_at", now_utc) and not s.get("asked_completion", False):
+        ends_at = ensure_aware(s.get("ends_at")) or now_utc
+        if now_utc >= ends_at and not s.get("asked_completion", False):
             try:
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("✅ Done", callback_data="sess:complete_yes"),
@@ -785,7 +793,7 @@ async def cron_sessions_tick(app: Application):
             continue
 
         # If still within timebox, handle start/still-working checks
-        nca = s.get("next_check_at")
+        nca = ensure_aware(s.get("next_check_at"))
         if not nca or now_utc < nca:
             continue
 
