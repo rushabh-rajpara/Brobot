@@ -640,6 +640,7 @@ tg_app.add_error_handler(on_error)
 @app.on_event("startup")
 async def verify_dependencies():
     await tg_app.initialize()
+    await tg_app.start()
     try:
         mongo.admin.command("ping")
         logger.info("Mongo ok")
@@ -664,6 +665,7 @@ async def verify_dependencies():
     
 @app.on_event("shutdown")
 async def on_shutdown():
+    await tg_app.stop()
     await tg_app.shutdown()   
     
 @app.get("/health")
