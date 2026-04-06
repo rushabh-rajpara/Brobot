@@ -189,25 +189,49 @@ def today_key_for_user(user_id: int) -> str:
 def date_key_for_user(user_id: int, delta_days: int = 0) -> str:
     return (local_now_for_user(user_id).date() + timedelta(days=delta_days)).isoformat()
 
-def list_user_goals(user_id: int):
-    return list(goals.find({"user_id": user_id}).sort([("updated_at", DESCENDING), ("goal", ASCENDING)]))
+def active_goal_query(user_id: int) -> Dict[str, Any]:
+    return {
+        "user_id": user_id,
+        "$or": [
+            {"status": {"$exists": False}},
+            {"status": {"$in": ["active", "ACTIVE"]}},
+        ],
+    }
 
-def get_goal_by_ref(user_id: int, goal_ref: str):
+def list_user_goals(user_id: int, *, include_completed: bool = False):
+    query = {"user_id": user_id} if include_completed else active_goal_query(user_id)
+    return list(goals.find(query).sort([("updated_at", DESCENDING), ("goal", ASCENDING)]))
+
+def get_goal_by_ref(user_id: int, goal_ref: str, *, include_completed: bool = False):
+    base_query = {"user_id": user_id} if include_completed else active_goal_query(user_id)
     try:
-        return goals.find_one({"_id": ObjectId(goal_ref), "user_id": user_id})
+        query = dict(base_query)
+        query["_id"] = ObjectId(goal_ref)
+        return goals.find_one(query)
     except Exception:
-        return goals.find_one({"user_id": user_id, "goal": goal_ref})
+        query = dict(base_query)
+        query["goal"] = goal_ref
+        return goals.find_one(query)
 
 def resolve_current_goal(user_id: int, *, sync_active: bool = True):
     user_doc = users.find_one({"user_id": user_id}) or {}
     active_goal = user_doc.get("active_goal")
     if active_goal:
-        active_doc = goals.find_one({"user_id": user_id, "goal": active_goal})
+        active_doc = goals.find_one({
+            "user_id": user_id,
+            "goal": active_goal,
+            "$or": [
+                {"status": {"$exists": False}},
+                {"status": {"$in": ["active", "ACTIVE"]}},
+            ],
+        })
         if active_doc:
             return active_doc
 
     ordered_goals = list_user_goals(user_id)
     if not ordered_goals:
+        if sync_active and active_goal:
+            users.update_one({"user_id": user_id}, {"$unset": {"active_goal": ""}})
         return None
 
     chosen = ordered_goals[0]
@@ -239,6 +263,22 @@ def upsert_today_intention(user_id: int, **fields):
         upsert=True,
     )
     return get_today_intention(user_id)
+
+def mark_goal_status(user_id: int, goal: str, status: str):
+    normalized = (status or "active").lower()
+    updates: Dict[str, Any] = {"status": normalized, "updated_at": now()}
+    if normalized == "done":
+        updates["completed_at"] = now()
+    else:
+        updates["completed_at"] = None
+    goals.update_one({"user_id": user_id, "goal": goal}, {"$set": updates}, upsert=False)
+    if normalized == "done":
+        if (users.find_one({"user_id": user_id}) or {}).get("active_goal") == goal:
+            next_goal = resolve_current_goal(user_id, sync_active=False)
+            if next_goal and next_goal.get("goal") != goal:
+                users.update_one({"user_id": user_id}, {"$set": {"active_goal": next_goal["goal"]}}, upsert=True)
+            else:
+                users.update_one({"user_id": user_id}, {"$unset": {"active_goal": ""}})
 
 def set_memory(user_id: int, key: str, value: Any, confidence: float = 0.5):
     memory.update_one(
@@ -596,7 +636,7 @@ async def safe_edit_message_text(query, text: str, *, reply_markup=None, parse_m
 def set_goal_why(user_id: int, goal: str, why: str):
     goals.update_one(
         {"user_id": user_id, "goal": goal},
-        {"$set": {"why": why, "updated_at": now()}},
+        {"$set": {"why": why, "status": "active", "completed_at": None, "updated_at": now()}},
         upsert=True
     )
 
@@ -921,6 +961,24 @@ def set_active_goal(user_id: int, goal: str) -> bool:
     users.update_one({"user_id": user_id}, {"$set": {"active_goal": g["goal"]}}, upsert=True)
     return True
 
+def daily_loop_hours_for_user(user_id: int) -> Dict[str, int]:
+    profile = ensure_profile(user_id)
+    user_doc = users.find_one({"user_id": user_id}) or {}
+    anchor_hour = profile.get("loop_anchor_hour")
+    if anchor_hour is None:
+        anchor_hour = user_doc.get("checkin_hour")
+    if anchor_hour is None:
+        work_start = int(profile.get("work_start_hour", 9))
+        anchor_hour = max(6, work_start - 1)
+    anchor_hour = int(anchor_hour)
+    midday = min(23, anchor_hour + 5)
+    end_of_day = min(23, anchor_hour + 11)
+    return {
+        "morning": anchor_hour,
+        "midday": midday,
+        "eod": end_of_day,
+    }
+
 def goals_list_buttons(user_id: int):
     items = list_user_goals(user_id)
     rows = []
@@ -1042,11 +1100,14 @@ def profile_summary(user_id: int) -> str:
     profile = ensure_profile(user_id)
     blockers = ", ".join(profile.get("blockers") or []) or "not set"
     goals_list = ", ".join(g["goal"] for g in list_user_goals(user_id)[:3]) or "none yet"
+    loop_hours = daily_loop_hours_for_user(user_id)
+    tz_name = get_user_timezone(user_id)
     return (
-        f"Timezone: {profile.get('timezone', TZ)}\n"
+        f"Timezone: {tz_name}\n"
         f"Goals: {goals_list}\n"
         f"Push style: {profile.get('push_style', 'firm')}\n"
         f"Work start: {profile.get('work_start_hour', 9):02d}:00\n"
+        f"Daily loop: {loop_hours['morning']:02d}:00 / {loop_hours['midday']:02d}:00 / {loop_hours['eod']:02d}:00 {tz_name}\n"
         f"Blockers: {blockers}\n"
         f"Restart size: {profile.get('restart_size_min', 10)} min"
     )
@@ -1155,6 +1216,9 @@ async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_user(user.id, "command:goals")
     items = list_user_goals(user.id)
     if not items:
+        completed_count = goals.count_documents({"user_id": user.id, "status": "done"})
+        if completed_count:
+            return await update.message.reply_text("No active goals right now. Finished goals are hidden from this list. Add a new one in /settings or with `/setgoal <goal> <why>`.", parse_mode="Markdown")
         return await update.message.reply_text("No goals yet. Add one: /setgoal <goal> <why>")
     u = users.find_one({"user_id": user.id}) or {}
     active = u.get("active_goal")
@@ -1173,7 +1237,13 @@ async def cmd_checkintime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         return await update.message.reply_text("Enter an hour 0–23.")
     users.update_one({"user_id": user.id}, {"$set": {"checkin_hour": hour}}, upsert=True)
-    await update.message.reply_text(f"Daily check-in set to {hour:02d}:00 {TZ}.")
+    set_profile_fields(user.id, loop_anchor_hour=hour)
+    loop_hours = daily_loop_hours_for_user(user.id)
+    tz_name = get_user_timezone(user.id)
+    await update.message.reply_text(
+        f"Daily loop anchor set to {hour:02d}:00 {tz_name}.\n"
+        f"Morning: {loop_hours['morning']:02d}:00 | Midday: {loop_hours['midday']:02d}:00 | End-of-day: {loop_hours['eod']:02d}:00"
+    )
 
 async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1234,7 +1304,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu:goals":
         items = list_user_goals(user.id)
         if not items:
-            await safe_edit_message_text(query, "No goals yet. Add one with /settings or `/setgoal <goal> <why>`.", parse_mode="Markdown")
+            completed_count = goals.count_documents({"user_id": user.id, "status": "done"})
+            if completed_count:
+                await safe_edit_message_text(query, "No active goals right now. Finished goals are hidden here. Add a fresh one in /settings or with `/setgoal <goal> <why>`.", parse_mode="Markdown")
+            else:
+                await safe_edit_message_text(query, "No goals yet. Add one with /settings or `/setgoal <goal> <why>`.", parse_mode="Markdown")
         else:
             active = (users.find_one({"user_id": user.id}) or {}).get("active_goal")
             lst = "\n".join([f"• {g['goal']}" + ("  ← active" if g['goal'] == active else "") for g in items])
@@ -1635,11 +1709,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Done
     if data.startswith("done:"):
         goal = data.split(":")[1]
+        mark_goal_status(user.id, goal, "done")
         bump_streak(user.id, 1)
         udoc = users.find_one({"user_id": user.id}) or {}
         line = praise_line(udoc.get("streak", 0))
         log_event(user.id, "done", {"goal": goal})
-        await query.edit_message_text(f"✅ Logged: {goal}. {line}")
+        await query.edit_message_text(f"✅ Logged: {goal}. Goal marked done, so it will drop out of your active list. {line}")
         return
 
     # Skip → friction + ask reason
@@ -1811,13 +1886,7 @@ async def run_override(user_id: int, goal: str, context: ContextTypes.DEFAULT_TY
     await context.bot.send_message(chat_id=user_id, text=f"{step1}\n\n{step2}\n\n{step3}")
 
 def loop_hours_for_user(user_id: int) -> Dict[str, int]:
-    profile = ensure_profile(user_id)
-    work_start = int(profile.get("work_start_hour", 9))
-    return {
-        "morning": max(6, work_start - 1),
-        "midday": min(15, work_start + 4),
-        "eod": min(22, work_start + 10),
-    }
+    return daily_loop_hours_for_user(user_id)
 
 async def send_intervention_message(app: Application, user_id: int, trigger: str, *, blocker: str | None = None, session_doc: Dict[str, Any] | None = None, reply_markup=None):
     intervention = choose_intervention(user_id, trigger, blocker=blocker, session_doc=session_doc)
