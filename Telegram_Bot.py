@@ -1489,7 +1489,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if intention.get("status") == status:
             await query.answer(f"Already marked {status}.")
             return
+        selected_goal = intention.get("selected_goal")
+        if status == "done" and selected_goal:
+            mark_goal_status(user.id, selected_goal, "done")
+        elif status == "active" and selected_goal:
+            mark_goal_status(user.id, selected_goal, "active")
         intention = upsert_today_intention(user.id, status=status)
+        intention = get_today_intention(user.id) or intention
         await safe_edit_message_text(
             query,
             intention_summary(user.id),
@@ -1502,9 +1508,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not intention:
             await query.edit_message_text("No daily intention found yet. Start with Today's intention first.")
             return
+        summary = intention_summary(user.id)
+        intention = get_today_intention(user.id) or intention
         await safe_edit_message_text(
             query,
-            intention_summary(user.id),
+            summary,
             reply_markup=intention_action_buttons(intention.get("status")),
         )
         return
