@@ -200,9 +200,12 @@ def upsert_today_intention(user_id: int, **fields):
         "updated_at": now(),
     }
     payload.update(fields)
+    insert_defaults = {"created_at": now()}
+    if "status" not in payload:
+        insert_defaults["status"] = "planned"
     daily_intentions.update_one(
         {"user_id": user_id, "date": date_key},
-        {"$set": payload, "$setOnInsert": {"created_at": now(), "status": "planned"}},
+        {"$set": payload, "$setOnInsert": insert_defaults},
         upsert=True,
     )
     return get_today_intention(user_id)
