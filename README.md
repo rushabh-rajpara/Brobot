@@ -1,82 +1,175 @@
-# 🤖 BroBot – Your AI Accountability Partner
+# Brobot v2
 
-**BroBot** is your no-nonsense, always-on, motivational sidekick living inside Telegram.  
-It keeps you focused, checks in regularly, tracks your goals, and isn't afraid to drop a roast when you're slacking.
+Brobot v2 is a Telegram accountability bot focused on friction reduction.
+It uses button-first conversational flows for onboarding, daily intentions, daily loop prompts, focus sessions, and recovery nudges.
 
----
+## What It Does
 
-## 🌟 Features
+- Guides onboarding with buttons plus a few text answers:
+  - timezone
+  - 1-3 active goals
+  - why each goal matters
+  - push style
+  - work start time
+  - common blockers
+  - restart size
+- Stores a daily intention with:
+  - date
+  - selected goal
+  - target
+  - fallback
+  - status
+- Runs a daily loop:
+  - Morning Anchor: `Continue yesterday / New target / You choose`
+  - Midday Check: `Started / Almost / Avoiding`
+  - End-of-Day: `Done / Partial / Missed / Reset tomorrow`
+- Starts focus sessions from chat buttons or `/focus`
+- Sends optional session nudges and completion prompts
+- Uses a deterministic intervention engine for:
+  - no response after morning prompt
+  - inactivity after target selection
+  - unfinished session
+  - repeated avoidance
+  - missed day
+  - stale goal
+- Stores structured behavioral memory and intervention outcomes
+- Sends a weekly summary based on stored facts, with AI only phrasing the output
 
-### 🧠 AI Motivation Engine (Powered by Cohere)
-- Understands your replies and gives smart responses
-- Motivational when you're down, savage when you're distracted
-- Personalized based on your **current daily goal**
+## Primary Commands
 
-### 🕒 Daily Routine Management
-- **9 AM morning motivation** to kickstart your day
-- **Goal prompt** every morning to set your main focus
-- **2-hour check-ins** to keep you accountable (skips during work hours)
-- **10:30 PM reflection** to ask if you completed your goal
-- **Midday goal reminder** (1:30 PM) to keep it top-of-mind
+Primary command surface:
 
-### 🔥 Goal Streak + Badges
-- Tracks your daily goal streak
-- Awards motivational badges based on your consistency:
-  - 🥉 Bronze • 🥈 Silver • 🥇 Gold • 🔥 Flame • 🏆 Platinum Crown
-- View your streak + badge with `/streak`
+- `/start`
+- `/goals`
+- `/focus`
+- `/override`
+- `/settings`
 
-### 📈 Weekly Progress & History
-- Emoji-based 7-day progress chart (✅ / ❌)
-- Full daily goal archive with `/history`
+Backward-compatible legacy commands still exist:
 
-### 👀 Passive Mode Detection
-- If you don't set a goal in 5 hours, BroBot checks in:
-  > "Yo… you ghosting your goals again?"
+- `/setgoal`
+- `/setactive`
+- `/checkintime`
+- `/checkin`
+- `/stats`
 
-### 📅 Smart Scheduling
-- Customize job hours with `/schedule`
-- BroBot stays silent during your work blocks
+These older commands are kept for compatibility, but the intended setup flow is now button-first through `/start` and `/settings`.
 
-### ⏸️ Manual Control
-- Pause with `/pause`, resume with `/resume`
+## Architecture Notes
 
-### 📊 Usage Stats
-- All commands listed with `/help`
+- Runtime shape:
+  - FastAPI app receives Telegram webhooks
+  - `python-telegram-bot` handles commands, callbacks, and text routing
+  - MongoDB stores users, goals, sessions, state, intentions, memory, and intervention outcomes
+  - Cohere is used for phrasing only, not business logic
+- Main app entrypoint:
+  - `Telegram_Bot.py`
+- Deterministic logic decides:
+  - current goal
+  - daily loop timing
+  - trigger detection
+  - blocker mapping
+  - intervention mode/action
+  - weekly summary facts
 
----
+## Cron Endpoints
 
-## 🧰 Tech Stack
+Protected by `?secret=$CRON_SECRET`:
 
-- **Python**
-- **python-telegram-bot v20+**
-- **Cohere API** (for AI replies)
-- **MongoDB Atlas** (for memory)
-- **APScheduler** (for scheduled tasks)
-- **Railway / Render / Replit** (for free deployment)
+- `GET /cron/daily`
+  - Runs the daily loop service
+  - Sends morning/midday/end-of-day prompts
+  - Sends inactivity/avoidance/missed-day/stale-goal recovery prompts
+- `GET /cron/weekly`
+  - Sends weekly summaries
+- `GET /cron/sessions-tick`
+  - Sends focus-session nudges
+  - Sends completion prompts when sessions time out
 
----
+Other useful endpoints:
 
-## 📦 Command List
+- `GET /health`
+- `POST /webhook`
+- `POST /sessions/start`
+- `POST /sessions/finish`
+- `POST /events`
 
-| Command        | Description                                       |
-|----------------|---------------------------------------------------|
-| `/start`       | Wake up BroBot                                    |
-| `/goal`        | Set today's main focus                            |
-| `/status`      | View current goal                                 |
-| `/pause`       | Pause all check-ins                               |
-| `/resume`      | Resume check-ins                                  |
-| `/schedule`    | Set your job schedule                             |
-| `/showschedule`| Show current job schedule                         |
-| `/streak`      | View your streak + motivational badge             |
-| `/history`     | See last 7 days of goals                          |                             |
-| `/help`        | Show all commands                                 |
+## Environment Variables
 
----
+Required:
 
-## 🚀 Getting Started
+- `BOT_TOKEN`
+- `MONGO_URI`
+- `COHERE_API_KEY`
 
-1. Clone the repo
-2. Add your `BOT_TOKEN`, `MONGO_URL`, `CHAT_ID`, and `COHERE_API_KEY`
-3. Run the script:
-   ```bash
-   python File_name.py
+Recommended:
+
+- `COHERE_MODEL`
+  - default: `command-r-08-2024`
+- `TZ`
+  - default: `America/Toronto`
+- `TELEGRAM_SECRET_TOKEN`
+- `CRON_SECRET`
+- `WEBHOOK_URL`
+  - public webhook base URL, for example `https://brobot-l2g7.onrender.com`
+- `LOG_LEVEL`
+  - default: `INFO`
+
+## Local Run
+
+1. Create and activate a Python 3.11 environment.
+2. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+3. Set environment variables.
+4. Run the app:
+
+```bash
+uvicorn Telegram_Bot:app --host 0.0.0.0 --port 10000
+```
+
+5. For local testing without Telegram traffic, verify:
+
+```bash
+python -m py_compile Telegram_Bot.py
+```
+
+## Render Deployment Notes
+
+- The web service runs the FastAPI app from `Telegram_Bot.py`.
+- `WEBHOOK_URL` should match the public Render hostname.
+- Render cron jobs should call:
+  - `/cron/daily`
+  - `/cron/weekly`
+  - `/cron/sessions-tick`
+- The current `render.yaml` is aligned to:
+  - `https://brobot-l2g7.onrender.com`
+
+## Operational Checks
+
+After deploy:
+
+1. Open `/health` and confirm it returns `ok`.
+2. Confirm Telegram webhook points to `/webhook`.
+3. Send `/start` and verify onboarding/settings buttons appear.
+4. Create a daily intention and start a focus session from buttons.
+5. Trigger:
+   - `/cron/daily`
+   - `/cron/weekly`
+   - `/cron/sessions-tick`
+6. Check logs for structured events such as:
+   - `morning_prompt_sent`
+   - `midday_prompt_sent`
+   - `eod_prompt_sent`
+   - `session_nudge_sent`
+   - `intervention_send`
+   - `weekly_summary_sent`
+
+## Safety Notes
+
+- Do not commit live secrets.
+- Rotate any secrets that were previously committed.
+- Keep Mongo timezones consistent and prefer the bot's stored user timezone for user-facing scheduling.

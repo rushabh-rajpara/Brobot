@@ -526,6 +526,20 @@ def log_event(user_id: int, kind: str, data: Dict[str, Any] | None = None):
         "data": data or {}
     })
 
+def log_structured(event: str, **fields):
+    pairs = " ".join(f"{key}={fields[key]!r}" for key in sorted(fields))
+    logger.info("event=%s %s", event, pairs)
+
+async def safe_edit_message_text(query, text: str, *, reply_markup=None, parse_mode=None):
+    try:
+        await query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+        return True
+    except BadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            await query.answer("Already up to date.")
+            return False
+        raise
+
 def set_goal_why(user_id: int, goal: str, why: str):
     goals.update_one(
         {"user_id": user_id, "goal": goal},
@@ -903,7 +917,7 @@ async def cmd_setgoal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(user.id, user.full_name or "")
     touch_user(user.id, "command:setgoal")
     if not context.args or len(context.args) < 2:
-        return await update.message.reply_text("Usage: /setgoal <goal> <your reason>")
+        return await update.message.reply_text("Legacy setup command. Use /settings for the button-first flow, or `/setgoal <goal> <your reason>` for compatibility.", parse_mode="Markdown")
     goal = context.args[0].lower()
     why = " ".join(context.args[1:])
     set_goal_why(user.id, goal, why)
@@ -919,7 +933,7 @@ async def cmd_setactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(user.id, user.full_name or "")
     touch_user(user.id, "command:setactive")
     if not context.args:
-        return await update.message.reply_text("Usage: /setactive <goal>")
+        return await update.message.reply_text("Legacy setup command. Use /goals to switch with buttons, or `/setactive <goal>` for compatibility.", parse_mode="Markdown")
     goal = context.args[0].lower()
     ok = set_active_goal(user.id, goal)
     if not ok:
@@ -941,7 +955,7 @@ async def cmd_checkintime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     touch_user(user.id, "command:checkintime")
     if not context.args:
-        return await update.message.reply_text("Usage: /checkintime <hour 0-23>")
+        return await update.message.reply_text("Legacy settings command. Prefer /settings, or use `/checkintime <hour 0-23>` for compatibility.", parse_mode="Markdown")
     try:
         hour = int(context.args[0])
         if not (0 <= hour <= 23):
@@ -1010,20 +1024,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu:goals":
         items = list_user_goals(user.id)
         if not items:
-            await query.edit_message_text("No goals yet. Add one with /setgoal <goal> <why>.")
+            await safe_edit_message_text(query, "No goals yet. Add one with /settings or `/setgoal <goal> <why>`.", parse_mode="Markdown")
         else:
             active = (users.find_one({"user_id": user.id}) or {}).get("active_goal")
             lst = "\n".join([f"• {g['goal']}" + ("  ← active" if g['goal'] == active else "") for g in items])
-            await query.edit_message_text(f"Your goals:\n{lst}", reply_markup=goals_list_buttons(user.id))
+            await safe_edit_message_text(query, f"Your goals:\n{lst}", reply_markup=goals_list_buttons(user.id))
         return
 
     if data == "menu:settings":
-        await query.edit_message_text("Settings\n\n" + profile_summary(user.id), reply_markup=settings_buttons(user.id))
+        await safe_edit_message_text(query, "Settings\n\n" + profile_summary(user.id), reply_markup=settings_buttons(user.id))
         return
 
     if data == "ob:begin":
         set_profile_conversation(user.id, "onboarding", "timezone_choice", {"goal_count": 0})
-        await query.edit_message_text(
+        await safe_edit_message_text(
+            query,
             "Onboarding step 1/6.\nChoose your timezone, or enter it manually if it isn't listed.",
             reply_markup=timezone_buttons(),
         )
@@ -1033,12 +1048,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tz_value = data.split(":", 2)[2]
         if tz_value == "manual":
             set_profile_conversation(user.id, "onboarding", "timezone_text", {"goal_count": 0})
-            await query.edit_message_text("Send your timezone as an IANA string, for example `America/Toronto`.", parse_mode="Markdown")
+            await safe_edit_message_text(query, "Send your timezone as an IANA string, for example `America/Toronto`.", parse_mode="Markdown")
             return
         set_profile_fields(user.id, timezone=tz_value)
         users.update_one({"user_id": user.id}, {"$set": {"tz": tz_value}}, upsert=True)
         set_profile_conversation(user.id, "onboarding", "goal_name", {"goal_count": 0})
-        await query.edit_message_text("Onboarding step 2/6.\nSend goal 1 in a few words.")
+        await safe_edit_message_text(query, "Onboarding step 2/6.\nSend goal 1 in a few words.")
         return
 
     if data.startswith("ob:goal_more:"):
@@ -1111,7 +1126,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Set at least one goal first with /setgoal <goal> <why>.")
             return
         set_profile_conversation(user.id, "intention", "goal_pick", {})
-        await query.edit_message_text("Choose the goal for today's intention.", reply_markup=intention_goal_buttons(user.id))
+        await safe_edit_message_text(query, "Choose the goal for today's intention.", reply_markup=intention_goal_buttons(user.id))
         return
 
     if data.startswith("intent:goal:"):
@@ -1123,7 +1138,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         goal = goal_doc["goal"]
         upsert_today_intention(user.id, selected_goal=goal, status="planned")
         set_profile_conversation(user.id, "intention", "target_text", {"selected_goal": goal})
-        await query.edit_message_text(f"What's today's target for {goal}?")
+        await safe_edit_message_text(query, f"What's today's target for {goal}?")
         return
 
     if data.startswith("intent:status:"):
@@ -1136,16 +1151,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"Already marked {status}.")
             return
         intention = upsert_today_intention(user.id, status=status)
-        try:
-            await query.edit_message_text(
-                intention_summary(user.id),
-                reply_markup=intention_action_buttons(intention.get("status")),
-            )
-        except BadRequest as exc:
-            if "message is not modified" in str(exc).lower():
-                await query.answer(f"Status already {status}.")
-                return
-            raise
+        await safe_edit_message_text(
+            query,
+            intention_summary(user.id),
+            reply_markup=intention_action_buttons(intention.get("status")),
+        )
         return
 
     if data == "intent:refresh":
@@ -1153,7 +1163,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not intention:
             await query.edit_message_text("No daily intention found yet. Start with Today's intention first.")
             return
-        await query.edit_message_text(
+        await safe_edit_message_text(
+            query,
             intention_summary(user.id),
             reply_markup=intention_action_buttons(intention.get("status")),
         )
@@ -1165,12 +1176,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not goal:
             await query.edit_message_text("Set a goal first, then come back to focus.")
             return
-        await query.edit_message_text(f"Pick a focus duration for {goal}.", reply_markup=focus_duration_buttons())
+        await safe_edit_message_text(query, f"Pick a focus duration for {goal}.", reply_markup=focus_duration_buttons())
         return
 
     if data.startswith("focus:dur:"):
         minutes = int(data.split(":")[2])
-        await query.edit_message_text(
+        await safe_edit_message_text(
+            query,
             f"{minutes} minutes selected.\nDo you want nudges during this session?",
             reply_markup=focus_nudge_buttons(minutes),
         )
@@ -1532,6 +1544,7 @@ async def send_intervention_message(app: Application, user_id: int, trigger: str
     intervention = choose_intervention(user_id, trigger, blocker=blocker, session_doc=session_doc)
     text = phrase_intervention(user_id, intervention)
     await app.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
+    log_structured("intervention_send", user_id=user_id, trigger=trigger, mode=intervention.get("mode"), blocker=intervention.get("blocker"), session_id=str(session_doc["_id"]) if session_doc else None)
     log_event(user_id, "intervention", {"trigger": trigger, "mode": intervention.get("mode"), "blocker": blocker, "session_id": str(session_doc["_id"]) if session_doc else None})
     record_intervention_outcome(
         user_id,
@@ -1567,6 +1580,7 @@ async def run_daily_loop_service(app: Application):
             if hour == hours["morning"] and not intention.get("morning_prompt_sent_at"):
                 upsert_today_intention(uid, morning_prompt_sent_at=now(), status=intention.get("status") or "planned")
                 await app.bot.send_message(uid, text=morning_summary_text(uid), reply_markup=morning_anchor_buttons())
+                log_structured("morning_prompt_sent", user_id=uid, hour=hour, date=today_key_for_user(uid))
                 log_event(uid, "daily_loop", {"phase": "morning_anchor"})
                 continue
 
@@ -1581,6 +1595,7 @@ async def run_daily_loop_service(app: Application):
             if hour == hours["midday"] and intention.get("target") and not intention.get("midday_prompt_sent_at"):
                 upsert_today_intention(uid, midday_prompt_sent_at=now())
                 await app.bot.send_message(uid, text="Midday check. Where are you at?", reply_markup=midday_check_buttons())
+                log_structured("midday_prompt_sent", user_id=uid, hour=hour, goal=intention.get("selected_goal"))
                 log_event(uid, "daily_loop", {"phase": "midday"})
                 continue
 
@@ -1595,6 +1610,7 @@ async def run_daily_loop_service(app: Application):
             if hour == hours["eod"] and intention.get("target") and not intention.get("eod_prompt_sent_at"):
                 upsert_today_intention(uid, eod_prompt_sent_at=now())
                 await app.bot.send_message(uid, text="End of day check. How did it go?", reply_markup=end_of_day_buttons())
+                log_structured("eod_prompt_sent", user_id=uid, hour=hour, goal=intention.get("selected_goal"))
                 log_event(uid, "daily_loop", {"phase": "eod"})
                 continue
 
@@ -1624,20 +1640,25 @@ def _hour_bucket(dt_utc): return dt_utc.strftime("%Y-%m-%dT%H")
 
 async def cron_daily(app: Application):
     """Run the daily loop prompts and recovery checks."""
+    log_structured("cron_daily_start")
     await run_daily_loop_service(app)
+    log_structured("cron_daily_finish")
 
 async def cron_weekly(app: Application):
     """Send a deterministic weekly summary phrased by AI."""
+    log_structured("cron_weekly_start")
     for u in users.find({}):
         uid = u["user_id"]
         try:
             facts = weekly_summary_facts(uid)
             msg = phrase_weekly_summary(uid, facts)
             await app.bot.send_message(chat_id=uid, text=msg)
+            log_structured("weekly_summary_sent", user_id=uid, days_active=facts.get("days_active"), main_blocker=facts.get("main_blocker_pattern"), what_worked=facts.get("what_worked"))
             log_event(uid, "insight", facts)
             set_memory(uid, "last_weekly_summary", facts, 0.85)
         except Exception:
             logger.exception("Weekly summary failed for user_id=%s", uid)
+    log_structured("cron_weekly_finish")
 
 # =========================
 # FASTAPI WIRING
@@ -1792,6 +1813,7 @@ async def api_events(request: Request):
 def _session_msg_goal_line(s): return f"**{s.get('goal','—')}**"
 
 async def cron_sessions_tick(app: Application):
+    log_structured("cron_sessions_tick_start")
     now_utc = now()
     active = list(sessions.find({"state": "ACTIVE"}))
     for s in active:
@@ -1805,6 +1827,7 @@ async def cron_sessions_tick(app: Application):
                     reply_markup=focus_completion_buttons(),
                     parse_mode="Markdown",
                 )
+                log_structured("session_completion_prompt_sent", user_id=uid, session_id=str(s["_id"]), goal=s.get("goal"))
                 sessions.update_one({"_id": s["_id"]}, {"$set": {"asked_completion": True}})
             except Exception:
                 logger.exception("Session completion prompt failed for user_id=%s", uid)
@@ -1838,9 +1861,11 @@ async def cron_sessions_tick(app: Application):
 
         try:
             await app.bot.send_message(uid, text=txt, reply_markup=kb, parse_mode="Markdown")
+            log_structured("session_nudge_sent", user_id=uid, session_id=str(s["_id"]), started=started, nudges_sent=nudges + 1)
             sessions.update_one({"_id": s["_id"]}, {"$set": {"next_check_at": next_dt}, "$inc": {"nudges_sent": 1}})
         except Exception:
             logger.exception("Session tick failed for user_id=%s", uid)
+    log_structured("cron_sessions_tick_finish", active_sessions=len(active))
 
 # Endpoint to trigger it (like your other cron endpoints)
 @app.get("/cron/sessions-tick")

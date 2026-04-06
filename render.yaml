@@ -11,12 +11,18 @@ services:
         sync: false
       - key: COHERE_API_KEY
         sync: false
+      - key: COHERE_MODEL
+        value: command-r-08-2024
       - key: TZ
         value: America/Toronto
       - key: TELEGRAM_SECRET_TOKEN
         sync: false
       - key: CRON_SECRET
         sync: false
+      - key: WEBHOOK_URL
+        value: https://brobot-l2g7.onrender.com
+      - key: LOG_LEVEL
+        value: INFO
 
 cronJobs:
   - name: brobot-daily-hourly-tick
@@ -25,7 +31,15 @@ cronJobs:
       - key: CRON_SECRET
         sync: false
     command: |
-      curl -fsS "https://brobot.onrender.com/cron/daily?secret=$CRON_SECRET"
+      curl -fsS "https://brobot-l2g7.onrender.com/cron/daily?secret=$CRON_SECRET"
+
+  - name: brobot-sessions-tick
+    schedule: "*/5 * * * *"
+    envVars:
+      - key: CRON_SECRET
+        sync: false
+    command: |
+      curl -fsS "https://brobot-l2g7.onrender.com/cron/sessions-tick?secret=$CRON_SECRET"
 
   - name: brobot-weekly-digest
     schedule: "0 9 * * MON"
@@ -33,4 +47,4 @@ cronJobs:
       - key: CRON_SECRET
         sync: false
     command: |
-      curl -fsS "https://brobot.onrender.com/cron/weekly?secret=$CRON_SECRET"
+      curl -fsS "https://brobot-l2g7.onrender.com/cron/weekly?secret=$CRON_SECRET"
