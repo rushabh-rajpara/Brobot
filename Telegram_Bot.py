@@ -83,6 +83,7 @@ daily_intentions.create_index([("user_id", ASCENDING), ("date", ASCENDING)], uni
 COMMON_BLOCKERS = ["overwhelmed", "distracted", "tired", "anxious", "perfectionist"]
 PUSH_STYLES = ["gentle", "firm", "ruthless"]
 RESTART_SIZES = [5, 10, 15]
+FOCUS_DURATIONS = [5, 10, 15, 25, 45]
 TIMEZONE_CHOICES = [
     "America/Toronto",
     "America/New_York",
@@ -163,6 +164,9 @@ def local_now_for_user(user_id: int) -> dt.datetime:
 def today_key_for_user(user_id: int) -> str:
     return local_now_for_user(user_id).date().isoformat()
 
+def date_key_for_user(user_id: int, delta_days: int = 0) -> str:
+    return (local_now_for_user(user_id).date() + timedelta(days=delta_days)).isoformat()
+
 def list_user_goals(user_id: int):
     return list(goals.find({"user_id": user_id}).sort([("updated_at", DESCENDING), ("goal", ASCENDING)]))
 
@@ -192,6 +196,9 @@ def resolve_current_goal(user_id: int, *, sync_active: bool = True):
 def get_today_intention(user_id: int):
     return daily_intentions.find_one({"user_id": user_id, "date": today_key_for_user(user_id)})
 
+def get_intention_for_date(user_id: int, date_key: str):
+    return daily_intentions.find_one({"user_id": user_id, "date": date_key})
+
 def upsert_today_intention(user_id: int, **fields):
     date_key = today_key_for_user(user_id)
     payload = {
@@ -210,6 +217,31 @@ def upsert_today_intention(user_id: int, **fields):
         upsert=True,
     )
     return get_today_intention(user_id)
+
+def touch_user(user_id: int, source: str):
+    ts = now()
+    state.update_one({"user_id": user_id}, {"$set": {"last_user_touch_at": ts}}, upsert=True)
+    set_profile_fields(user_id, last_user_touch_at=ts, last_user_touch_source=source)
+
+def get_state(user_id: int) -> Dict[str, Any]:
+    return state.find_one({"user_id": user_id}) or {}
+
+def get_recent_logs(user_id: int, *, kind: str | None = None, limit: int = 20):
+    query = {"user_id": user_id}
+    if kind:
+        query["kind"] = kind
+    return list(logs.find(query).sort("ts", DESCENDING).limit(limit))
+
+def recent_avoidance_count(user_id: int) -> int:
+    count = 0
+    for doc in get_recent_logs(user_id, kind="loop_status", limit=10):
+        status = (doc.get("data") or {}).get("status")
+        if status in {"avoiding", "missed"}:
+            count += 1
+    return count
+
+def get_active_session(user_id: int):
+    return sessions.find_one({"user_id": user_id, "state": "ACTIVE"}, sort=[("started_at", DESCENDING)])
 
 def ensure_user(user_id: int, name: str):
     users.update_one(
@@ -241,7 +273,7 @@ def ensure_user(user_id: int, name: str):
 def get_current_goal(user_id: int):
     return resolve_current_goal(user_id)
 
-def start_session(user_id: int, timebox_min: int, goal: str | None = None) -> ObjectId:
+def start_session(user_id: int, timebox_min: int, goal: str | None = None, *, nudges_enabled: bool = True, source: str = "command") -> ObjectId:
     g = goal or ((get_current_goal(user_id) or {}).get("goal"))
     if not g:
         raise ValueError("No goal set for user.")
@@ -262,10 +294,12 @@ def start_session(user_id: int, timebox_min: int, goal: str | None = None) -> Ob
         "next_check_at": None,
         "asked_completion": False,
         "positive_minutes": 0,
+        "nudges_enabled": bool(nudges_enabled),
+        "source": source,
     }
     res = sessions.insert_one(doc)
     sid = res.inserted_id
-    log_event(user_id, "session_start", {"goal": g, "timebox_min": timebox_min, "sid": str(sid)})
+    log_event(user_id, "session_start", {"goal": g, "timebox_min": timebox_min, "sid": str(sid), "nudges_enabled": bool(nudges_enabled), "source": source})
     return sid
 
 def finish_latest_session(user_id: int, state: str = "DONE") -> bool:
@@ -300,6 +334,27 @@ def ai_reply(prompt: str) -> str:
     except Exception:
         logger.exception("Cohere chat failed using model %s", COHERE_MODEL)
         return "Lock in. Pick the smallest useful next step and do it for 2 minutes right now."
+
+def phrase_intervention(user_id: int, intervention: Dict[str, Any]) -> str:
+    profile = ensure_profile(user_id)
+    goal = (resolve_current_goal(user_id) or {}).get("goal", "your target")
+    style = profile.get("push_style", "firm")
+    prompt = (
+        f"You are phrasing a deterministic Telegram accountability intervention.\n"
+        f"Push style: {style}.\n"
+        f"Goal: {goal}.\n"
+        f"Trigger: {intervention.get('trigger')}.\n"
+        f"Mode: {intervention.get('mode')}.\n"
+        f"Blocker: {intervention.get('blocker') or 'none'}.\n"
+        f"Action: {intervention.get('action')}.\n"
+        "Write 1-2 short Telegram-ready sentences. Do not invent logic or extra options."
+    )
+    try:
+        resp = co.chat(model=COHERE_MODEL, message=prompt, temperature=0.2)
+        return (resp.text or "").strip() or intervention.get("action", "Take the smallest next step now.")
+    except Exception:
+        logger.exception("Cohere intervention phrasing failed using model %s", COHERE_MODEL)
+        return intervention.get("action", "Take the smallest next step now.")
 
 def cooldown_active(user_id: int) -> bool:
     s = state.find_one({"user_id": user_id}) or {}
@@ -345,6 +400,75 @@ def bump_streak(user_id: int, delta: int = 1):
 def bump_missed(user_id: int, delta: int = 1):
     users.update_one({"user_id": user_id}, {"$inc": {"missed_days": delta}}, upsert=True)
 
+def detect_blocker(user_id: int, explicit: str | None = None) -> str:
+    if explicit in {"anxious", "scared"}:
+        return "anxious"
+    if explicit in COMMON_BLOCKERS:
+        return explicit
+    state_doc = get_state(user_id)
+    mood = state_doc.get("mood")
+    if mood in {"anxious", "tired", "distracted"}:
+        return mood
+    profile = ensure_profile(user_id)
+    blockers = profile.get("blockers") or []
+    return blockers[0] if blockers else "distracted"
+
+def blocker_action(blocker: str, restart_size_min: int, goal: str) -> str:
+    if blocker == "overwhelmed":
+        return f"Find the smallest visible step for {goal}. Make it obvious and do only that."
+    if blocker == "distracted":
+        return f"Phone down. Close the noisy tabs. Start {goal} immediately for {restart_size_min} minutes."
+    if blocker == "tired":
+        return f"Reduce {goal} to 5 clean minutes. The win is starting, not grinding."
+    if blocker == "anxious":
+        return f"This does not need to be pretty. Do one ugly first step for {goal} and let it be messy."
+    if blocker == "perfectionist":
+        return f"No polishing. Push a rough version of {goal} and stop when it is merely usable."
+    return f"Take one useful step on {goal} for {restart_size_min} minutes."
+
+def choose_intervention(user_id: int, trigger: str, *, blocker: str | None = None, session_doc: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    profile = ensure_profile(user_id)
+    goal_doc = resolve_current_goal(user_id)
+    goal = (goal_doc or {}).get("goal", "your target")
+    restart = int(profile.get("restart_size_min", 10))
+    blocker_name = detect_blocker(user_id, blocker)
+    mode = "starter"
+
+    if trigger == "no_response_after_morning_prompt":
+        mode = "starter"
+    elif trigger == "inactivity_after_target":
+        mode = "focus"
+    elif trigger == "unfinished_session":
+        mode = "focus" if blocker_name in {"distracted", "perfectionist"} else "recovery"
+    elif trigger == "repeated_avoidance":
+        mode = "recovery"
+    elif trigger == "missed_day":
+        mode = "momentum"
+    elif trigger == "stale_goal":
+        mode = "clarity"
+    elif trigger == "override":
+        mode = "override"
+
+    if mode == "clarity":
+        action = f"Pick the next visible win for {goal}. Name one outcome you can finish today and ignore the rest."
+    elif mode == "momentum":
+        action = f"Reset cleanly today. Choose a smaller target for {goal} and protect {restart} minutes for it."
+    elif mode == "override":
+        action = f"Stop spiraling. Breathe, stand up, and do the smallest safe action toward {goal} right now."
+    else:
+        action = blocker_action(blocker_name, restart, goal)
+
+    result = {
+        "trigger": trigger,
+        "mode": mode,
+        "blocker": blocker_name,
+        "action": action,
+        "goal": goal,
+        "restart_size_min": restart,
+        "session_id": str(session_doc["_id"]) if session_doc else None,
+    }
+    return result
+
 def mood_buttons():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("😴 Tired", callback_data="mood:tired"),
@@ -353,11 +477,59 @@ def mood_buttons():
          InlineKeyboardButton("✅ Fine", callback_data="mood:fine")]
     ])
 
+def blocker_choice_buttons(prefix: str = "recover"):
+    rows = []
+    for idx in range(0, len(COMMON_BLOCKERS), 2):
+        chunk = COMMON_BLOCKERS[idx:idx + 2]
+        rows.append([InlineKeyboardButton(b.title(), callback_data=f"{prefix}:blocker:{b}") for b in chunk])
+    return InlineKeyboardMarkup(rows)
+
 def action_buttons(goal: str):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"✅ I did {goal}", callback_data=f"done:{goal}")],
         [InlineKeyboardButton("🙅 Skip (give reason)", callback_data=f"skip:{goal}")],
         [InlineKeyboardButton("🆘 Emergency Override", callback_data=f"override:{goal}")]
+    ])
+
+def focus_duration_buttons():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{minutes} min", callback_data=f"focus:dur:{minutes}") for minutes in FOCUS_DURATIONS[:3]],
+        [InlineKeyboardButton(f"{minutes} min", callback_data=f"focus:dur:{minutes}") for minutes in FOCUS_DURATIONS[3:]],
+    ])
+
+def focus_nudge_buttons(minutes: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Nudges on", callback_data=f"focus:nudges:on:{minutes}"),
+         InlineKeyboardButton("No nudges", callback_data=f"focus:nudges:off:{minutes}")]
+    ])
+
+def focus_completion_buttons():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Done", callback_data="sess:end:done"),
+         InlineKeyboardButton("Partial", callback_data="sess:end:partial"),
+         InlineKeyboardButton("Blocked", callback_data="sess:end:blocked")]
+    ])
+
+def morning_anchor_buttons():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Continue yesterday", callback_data="loop:morning:continue")],
+        [InlineKeyboardButton("New target", callback_data="loop:morning:new"),
+         InlineKeyboardButton("You choose", callback_data="loop:morning:choose")]
+    ])
+
+def midday_check_buttons():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Started", callback_data="loop:midday:started"),
+         InlineKeyboardButton("Almost", callback_data="loop:midday:almost"),
+         InlineKeyboardButton("Avoiding", callback_data="loop:midday:avoiding")]
+    ])
+
+def end_of_day_buttons():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Done", callback_data="loop:eod:done"),
+         InlineKeyboardButton("Partial", callback_data="loop:eod:partial")],
+        [InlineKeyboardButton("Missed", callback_data="loop:eod:missed"),
+         InlineKeyboardButton("Reset tomorrow", callback_data="loop:eod:reset")]
     ])
 
 def tiny_steps(mood: str, goal: str) -> str:
@@ -464,11 +636,36 @@ def intention_goal_buttons(user_id: int):
     rows = [[InlineKeyboardButton(g["goal"], callback_data=f"intent:goal:{str(g['_id'])}")] for g in items[:3]]
     return InlineKeyboardMarkup(rows or [[InlineKeyboardButton("No goals yet", callback_data="noop")]])
 
-def intention_done_buttons():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Mark done", callback_data="intent:status:done"),
-         InlineKeyboardButton("Back to active", callback_data="intent:status:active")]
-    ])
+def intention_action_buttons(status: str | None):
+    current = (status or "planned").lower()
+    if current == "done":
+        rows = [[InlineKeyboardButton("Back to active", callback_data="intent:status:active")]]
+    else:
+        rows = [[InlineKeyboardButton("Mark done", callback_data="intent:status:done")]]
+    if current in {"planned", "active", "partial", "blocked"}:
+        rows.append([InlineKeyboardButton("Start focus", callback_data="focus:begin")])
+    rows.append([InlineKeyboardButton("Refresh intention", callback_data="intent:refresh")])
+    return InlineKeyboardMarkup(rows)
+
+def morning_summary_text(user_id: int) -> str:
+    yesterday = get_intention_for_date(user_id, date_key_for_user(user_id, -1))
+    if yesterday:
+        return (
+            "What matters most today?\n\n"
+            f"Yesterday: {yesterday.get('selected_goal') or '—'} | {yesterday.get('target') or '—'} | status: {yesterday.get('status') or 'planned'}"
+        )
+    return "What matters most today?"
+
+def render_intervention_text(user_id: int, trigger: str, *, blocker: str | None = None, session_doc: Dict[str, Any] | None = None) -> str:
+    intervention = choose_intervention(user_id, trigger, blocker=blocker, session_doc=session_doc)
+    return phrase_intervention(user_id, intervention)
+
+def focus_started_text(user_id: int, session_doc: Dict[str, Any]) -> str:
+    end_local = ensure_aware(session_doc.get("ends_at")) or now()
+    tz_name = get_user_timezone(user_id)
+    end_str = end_local.astimezone(ZoneInfo(tz_name)).strftime("%H:%M")
+    nudges_text = "Nudges are on." if session_doc.get("nudges_enabled", True) else "No nudges this round."
+    return f"Focus session started for {session_doc['goal']} — {session_doc['timebox_min']} min. Ends around {end_str}. {nudges_text}"
 
 def profile_summary(user_id: int) -> str:
     profile = ensure_profile(user_id)
@@ -501,6 +698,7 @@ def intention_summary(user_id: int) -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.full_name or user.username or "human")
+    touch_user(user.id, "command:start")
     profile = ensure_profile(user.id, user.full_name or user.username or "human")
     if profile.get("onboarding_complete"):
         msg = (
@@ -519,6 +717,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.full_name or user.username or "human")
+    touch_user(user.id, "command:settings")
     msg = "Settings\n\n" + profile_summary(user.id)
     await update.message.reply_text(msg, reply_markup=settings_buttons(user.id))
 
@@ -526,6 +725,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.full_name or user.username or "human")
+    touch_user(user.id, "command:focus")
     if not context.args:
         return await update.message.reply_text("Usage: /focus <minutes>  (e.g., /focus 25)")
     try:
@@ -540,21 +740,18 @@ async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Set a goal first: /setgoal <goal> <why>")
 
     try:
-        sid = start_session(user.id, mins, g["goal"])
+        sid = start_session(user.id, mins, g["goal"], nudges_enabled=True, source="command")
         sessions.update_one({"_id": sid}, {"$set": {"next_check_at": now() + timedelta(minutes=5)}})
     except Exception as e:
         return await update.message.reply_text(f"Could not start session: {e}")
 
-    end_local = (now() + timedelta(minutes=mins)).astimezone(TZINFO).strftime("%H:%M")
-    await update.message.reply_text(
-        f"🎯 Focus session started for **{g['goal']}** — {mins} min. Ends ~{end_local}.\n"
-        f"I’ll check in at +5 min.",
-        parse_mode="Markdown"
-    )
+    session_doc = sessions.find_one({"_id": sid}) or {"goal": g["goal"], "timebox_min": mins, "ends_at": now() + timedelta(minutes=mins), "nudges_enabled": True}
+    await update.message.reply_text(focus_started_text(user.id, session_doc), reply_markup=focus_completion_buttons())
 
 async def cmd_setgoal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.full_name or "")
+    touch_user(user.id, "command:setgoal")
     if not context.args or len(context.args) < 2:
         return await update.message.reply_text("Usage: /setgoal <goal> <your reason>")
     goal = context.args[0].lower()
@@ -570,6 +767,7 @@ async def cmd_setgoal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_setactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.full_name or "")
+    touch_user(user.id, "command:setactive")
     if not context.args:
         return await update.message.reply_text("Usage: /setactive <goal>")
     goal = context.args[0].lower()
@@ -580,6 +778,7 @@ async def cmd_setactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    touch_user(user.id, "command:goals")
     items = list_user_goals(user.id)
     if not items:
         return await update.message.reply_text("No goals yet. Add one: /setgoal <goal> <why>")
@@ -590,6 +789,7 @@ async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_checkintime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    touch_user(user.id, "command:checkintime")
     if not context.args:
         return await update.message.reply_text("Usage: /checkintime <hour 0-23>")
     try:
@@ -604,6 +804,7 @@ async def cmd_checkintime(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.full_name or "")
+    touch_user(user.id, "command:checkin")
     g = resolve_current_goal(user.id)
     if not g:
         return await update.message.reply_text("Set a goal first: /setgoal <goal> <why>")
@@ -619,6 +820,7 @@ async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    touch_user(user.id, "command:stats")
     u = users.find_one({"user_id": user.id}) or {}
     s = state.find_one({"user_id": user.id}) or {}
     gcount = goals.count_documents({"user_id": user.id})
@@ -637,6 +839,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_override(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    touch_user(user.id, "command:override")
     g = resolve_current_goal(user.id)
     if not g:
         return await update.message.reply_text("Set a goal first: /setgoal <goal> <why>")
@@ -648,6 +851,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     data = query.data
     ensure_user(user.id, user.full_name or user.username or "human")
+    touch_user(user.id, f"callback:{data.split(':', 1)[0]}")
 
     if data == "noop":
         await query.answer()
@@ -781,14 +985,172 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if intention.get("status") == status:
             await query.answer(f"Already marked {status}.")
             return
-        upsert_today_intention(user.id, status=status)
+        intention = upsert_today_intention(user.id, status=status)
         try:
-            await query.edit_message_text(intention_summary(user.id), reply_markup=intention_done_buttons())
+            await query.edit_message_text(
+                intention_summary(user.id),
+                reply_markup=intention_action_buttons(intention.get("status")),
+            )
         except BadRequest as exc:
             if "message is not modified" in str(exc).lower():
                 await query.answer(f"Status already {status}.")
                 return
             raise
+        return
+
+    if data == "intent:refresh":
+        intention = get_today_intention(user.id)
+        if not intention:
+            await query.edit_message_text("No daily intention found yet. Start with Today's intention first.")
+            return
+        await query.edit_message_text(
+            intention_summary(user.id),
+            reply_markup=intention_action_buttons(intention.get("status")),
+        )
+        return
+
+    if data == "focus:begin":
+        current = get_today_intention(user.id) or {}
+        goal = current.get("selected_goal") or (resolve_current_goal(user.id) or {}).get("goal")
+        if not goal:
+            await query.edit_message_text("Set a goal first, then come back to focus.")
+            return
+        await query.edit_message_text(f"Pick a focus duration for {goal}.", reply_markup=focus_duration_buttons())
+        return
+
+    if data.startswith("focus:dur:"):
+        minutes = int(data.split(":")[2])
+        await query.edit_message_text(
+            f"{minutes} minutes selected.\nDo you want nudges during this session?",
+            reply_markup=focus_nudge_buttons(minutes),
+        )
+        return
+
+    if data.startswith("focus:nudges:"):
+        _, _, nudges_value, minutes_value = data.split(":")
+        minutes = int(minutes_value)
+        nudges_enabled = nudges_value == "on"
+        current = get_today_intention(user.id) or {}
+        goal = current.get("selected_goal") or (resolve_current_goal(user.id) or {}).get("goal")
+        if not goal:
+            await query.edit_message_text("Set a goal first, then start a focus session.")
+            return
+        sid = start_session(user.id, minutes, goal, nudges_enabled=nudges_enabled, source="button")
+        next_check = now() + timedelta(minutes=5)
+        sessions.update_one({"_id": sid}, {"$set": {"next_check_at": next_check if nudges_enabled else None}})
+        session_doc = sessions.find_one({"_id": sid}) or {"goal": goal, "timebox_min": minutes, "ends_at": now() + timedelta(minutes=minutes), "nudges_enabled": nudges_enabled}
+        await query.edit_message_text(
+            focus_started_text(user.id, session_doc),
+            reply_markup=focus_completion_buttons(),
+        )
+        return
+
+    if data.startswith("sess:end:"):
+        outcome = data.split(":")[2]
+        mapped_state = {"done": "DONE", "partial": "DONE", "blocked": "ABORTED"}[outcome]
+        ok = finish_latest_session(user.id, state=mapped_state)
+        if outcome == "done":
+            upsert_today_intention(user.id, status="done")
+            log_event(user.id, "focus_completion", {"status": "done"})
+            await query.edit_message_text("Session logged as done. Keep the momentum.")
+        elif outcome == "partial":
+            upsert_today_intention(user.id, status="partial")
+            log_event(user.id, "focus_completion", {"status": "partial"})
+            await query.edit_message_text("Partial counts. Keep the useful pieces and reset clean.")
+        else:
+            upsert_today_intention(user.id, status="blocked")
+            log_event(user.id, "focus_completion", {"status": "blocked"})
+            await query.edit_message_text(
+                render_intervention_text(user.id, "unfinished_session"),
+                reply_markup=blocker_choice_buttons("recover"),
+            )
+        return
+
+    if data == "loop:morning:continue":
+        yesterday = get_intention_for_date(user.id, date_key_for_user(user.id, -1))
+        if not yesterday or not yesterday.get("selected_goal"):
+            await query.edit_message_text("No clean yesterday target found. Pick a new one instead.", reply_markup=intention_goal_buttons(user.id))
+            set_profile_conversation(user.id, "intention", "goal_pick", {})
+            return
+        upsert_today_intention(
+            user.id,
+            selected_goal=yesterday.get("selected_goal"),
+            target=yesterday.get("target"),
+            fallback=yesterday.get("fallback"),
+            status="active",
+            morning_choice="continue_yesterday",
+            morning_response_at=now(),
+        )
+        await query.edit_message_text(
+            intention_summary(user.id),
+            reply_markup=intention_action_buttons("active"),
+        )
+        return
+
+    if data == "loop:morning:new":
+        upsert_today_intention(user.id, morning_choice="new_target", morning_response_at=now(), status="planned")
+        set_profile_conversation(user.id, "intention", "goal_pick", {})
+        await query.edit_message_text("Pick the goal for today's target.", reply_markup=intention_goal_buttons(user.id))
+        return
+
+    if data == "loop:morning:choose":
+        current = resolve_current_goal(user.id)
+        if not current:
+            await query.edit_message_text("Set a goal first with /setgoal <goal> <why>.")
+            return
+        upsert_today_intention(user.id, selected_goal=current["goal"], morning_choice="you_choose", morning_response_at=now(), status="planned")
+        set_profile_conversation(user.id, "intention", "target_text", {"selected_goal": current["goal"]})
+        await query.edit_message_text(f"Today's best bet is {current['goal']}.\nWhat's the target?")
+        return
+
+    if data == "loop:midday:started":
+        upsert_today_intention(user.id, status="active", midday_status="started", midday_response_at=now())
+        log_event(user.id, "loop_status", {"phase": "midday", "status": "started"})
+        await query.edit_message_text("Good. Protect the next block and keep moving.", reply_markup=focus_duration_buttons())
+        return
+
+    if data == "loop:midday:almost":
+        upsert_today_intention(user.id, status="active", midday_status="almost", midday_response_at=now())
+        log_event(user.id, "loop_status", {"phase": "midday", "status": "almost"})
+        await query.edit_message_text(
+            render_intervention_text(user.id, "inactivity_after_target"),
+            reply_markup=focus_duration_buttons(),
+        )
+        return
+
+    if data == "loop:midday:avoiding":
+        upsert_today_intention(user.id, midday_status="avoiding", midday_response_at=now())
+        log_event(user.id, "loop_status", {"phase": "midday", "status": "avoiding"})
+        await query.edit_message_text(
+            "Name the blocker so I can give you the right restart.",
+            reply_markup=blocker_choice_buttons("recover"),
+        )
+        return
+
+    if data.startswith("recover:blocker:"):
+        blocker = data.split(":")[2]
+        upsert_today_intention(user.id, last_blocker=blocker)
+        await query.edit_message_text(
+            render_intervention_text(user.id, "repeated_avoidance", blocker=blocker),
+            reply_markup=focus_duration_buttons(),
+        )
+        return
+
+    if data.startswith("loop:eod:"):
+        status = data.split(":")[2]
+        mapped = {"done": "done", "partial": "partial", "missed": "missed", "reset": "reset_tomorrow"}[status]
+        upsert_today_intention(user.id, status=mapped, eod_status=mapped, eod_response_at=now())
+        log_event(user.id, "loop_status", {"phase": "eod", "status": mapped})
+        if status == "done":
+            bump_streak(user.id, 1)
+            await query.edit_message_text("Logged done. Bank the win and protect tomorrow.")
+        elif status == "missed":
+            bump_missed(user.id, 1)
+            await query.edit_message_text(render_intervention_text(user.id, "missed_day"))
+        elif status == "reset":
+            await query.edit_message_text("Reset accepted. Tomorrow starts with a clean board.")
+        else:
+            await query.edit_message_text("Partial logged. Keep the useful residue and come back tomorrow.")
         return
 
     # Mood selected
@@ -891,6 +1253,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.full_name or user.username or "human")
+    touch_user(user.id, "text")
     txt = (update.message.text or "").strip()
     logger.info("text_router received message from user_id=%s text=%r", user.id if user else None, txt)
 
@@ -941,7 +1304,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             target = data.get("target")
             upsert_today_intention(user.id, selected_goal=goal, target=target, fallback=txt, status="active")
             clear_profile_conversation(user.id)
-            return await update.message.reply_text(intention_summary(user.id), reply_markup=intention_done_buttons())
+            intention = get_today_intention(user.id) or {}
+            return await update.message.reply_text(
+                intention_summary(user.id),
+                reply_markup=intention_action_buttons(intention.get("status")),
+            )
 
     if cooldown_active(user.id):
         return await update.message.reply_text("Cooldown active. Back to work; try again later.")
@@ -977,6 +1344,92 @@ async def run_override(user_id: int, goal: str, context: ContextTypes.DEFAULT_TY
     log_event(user_id, "override", {"goal": goal})
     await context.bot.send_message(chat_id=user_id, text=f"{step1}\n\n{step2}\n\n{step3}")
 
+def loop_hours_for_user(user_id: int) -> Dict[str, int]:
+    profile = ensure_profile(user_id)
+    work_start = int(profile.get("work_start_hour", 9))
+    return {
+        "morning": max(6, work_start - 1),
+        "midday": min(15, work_start + 4),
+        "eod": min(22, work_start + 10),
+    }
+
+async def send_intervention_message(app: Application, user_id: int, trigger: str, *, blocker: str | None = None, session_doc: Dict[str, Any] | None = None, reply_markup=None):
+    text = render_intervention_text(user_id, trigger, blocker=blocker, session_doc=session_doc)
+    await app.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
+    log_event(user_id, "intervention", {"trigger": trigger, "blocker": blocker, "session_id": str(session_doc["_id"]) if session_doc else None})
+
+async def run_daily_loop_service(app: Application):
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    for u in users.find({}):
+        uid = u["user_id"]
+        try:
+            ensure_profile(uid, u.get("name", "human"))
+            local_now = now_utc.astimezone(ZoneInfo(get_user_timezone(uid)))
+            hour = local_now.hour
+            hours = loop_hours_for_user(uid)
+            intention = get_today_intention(uid) or {}
+            yesterday = get_intention_for_date(uid, date_key_for_user(uid, -1)) or {}
+            state_doc = get_state(uid)
+            current_goal = resolve_current_goal(uid)
+            last_touch = ensure_aware(state_doc.get("last_user_touch_at"))
+
+            if yesterday.get("status") == "missed" and hour == hours["morning"] and not intention.get("missed_day_recovery_sent_at"):
+                upsert_today_intention(uid, missed_day_recovery_sent_at=now(), morning_prompt_sent_at=intention.get("morning_prompt_sent_at") or now())
+                await send_intervention_message(app, uid, "missed_day", reply_markup=morning_anchor_buttons())
+                continue
+
+            if hour == hours["morning"] and not intention.get("morning_prompt_sent_at"):
+                upsert_today_intention(uid, morning_prompt_sent_at=now(), status=intention.get("status") or "planned")
+                await app.bot.send_message(uid, text=morning_summary_text(uid), reply_markup=morning_anchor_buttons())
+                log_event(uid, "daily_loop", {"phase": "morning_anchor"})
+                continue
+
+            morning_sent_at = ensure_aware(intention.get("morning_prompt_sent_at"))
+            if morning_sent_at and not intention.get("morning_response_at") and now() >= morning_sent_at + timedelta(hours=2):
+                if not last_touch or last_touch <= morning_sent_at:
+                    if not intention.get("morning_followup_sent_at"):
+                        upsert_today_intention(uid, morning_followup_sent_at=now())
+                        await send_intervention_message(app, uid, "no_response_after_morning_prompt", reply_markup=morning_anchor_buttons())
+                        continue
+
+            if hour == hours["midday"] and intention.get("target") and not intention.get("midday_prompt_sent_at"):
+                upsert_today_intention(uid, midday_prompt_sent_at=now())
+                await app.bot.send_message(uid, text="Midday check. Where are you at?", reply_markup=midday_check_buttons())
+                log_event(uid, "daily_loop", {"phase": "midday"})
+                continue
+
+            target_updated_at = ensure_aware(intention.get("updated_at"))
+            if intention.get("target") and intention.get("status") in {"planned", "active", "partial", "blocked"} and not get_active_session(uid):
+                if target_updated_at and now() >= target_updated_at + timedelta(minutes=90):
+                    if not intention.get("target_inactivity_sent_at") and (not last_touch or last_touch <= target_updated_at):
+                        upsert_today_intention(uid, target_inactivity_sent_at=now())
+                        await send_intervention_message(app, uid, "inactivity_after_target", reply_markup=focus_duration_buttons())
+                        continue
+
+            if hour == hours["eod"] and intention.get("target") and not intention.get("eod_prompt_sent_at"):
+                upsert_today_intention(uid, eod_prompt_sent_at=now())
+                await app.bot.send_message(uid, text="End of day check. How did it go?", reply_markup=end_of_day_buttons())
+                log_event(uid, "daily_loop", {"phase": "eod"})
+                continue
+
+            if recent_avoidance_count(uid) >= 2 and not intention.get("avoidance_recovery_sent_at"):
+                upsert_today_intention(uid, avoidance_recovery_sent_at=now())
+                await send_intervention_message(app, uid, "repeated_avoidance", reply_markup=blocker_choice_buttons("recover"))
+                continue
+
+            goal_updated_at = ensure_aware((current_goal or {}).get("updated_at"))
+            if current_goal and goal_updated_at and now() >= goal_updated_at + timedelta(days=7):
+                if not intention and not state_doc.get("stale_goal_sent_at"):
+                    state.update_one({"user_id": uid}, {"$set": {"stale_goal_sent_at": now()}}, upsert=True)
+                    await send_intervention_message(
+                        app,
+                        uid,
+                        "stale_goal",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Set today's target", callback_data="intent:begin")]]),
+                    )
+        except Exception:
+            logger.exception("Daily loop service failed for user_id=%s", uid)
+
 # =========================
 # CRON TASKS (hit by Cloudflare Cron)
 # =========================
@@ -984,26 +1437,8 @@ async def run_override(user_id: int, goal: str, context: ContextTypes.DEFAULT_TY
 def _hour_bucket(dt_utc): return dt_utc.strftime("%Y-%m-%dT%H")
 
 async def cron_daily(app: Application):
-    """Send check-ins to users at their chosen hour."""
-    now_utc = dt.datetime.now(dt.timezone.utc)
-    for u in users.find({}):
-        try:
-            local_hour = now_utc.astimezone(ZoneInfo(u.get("tz", TZ))).hour
-            if local_hour != u.get("checkin_hour", 8):
-                continue
-            bucket = _hour_bucket(now_utc)
-            if u.get("last_daily_sent") == bucket:
-                continue
-            g = resolve_current_goal(u["user_id"])
-            if not g:
-                continue
-            await app.bot.send_message(u["user_id"],
-            text=f"Daily check-in for **{g['goal']}**. How are you right now?",
-            reply_markup=mood_buttons(), parse_mode="Markdown")
-            users.update_one({"user_id": u["user_id"]}, {"$set": {"last_daily_sent": bucket}})
-            log_event(u["user_id"], "checkin", {"goal": g["goal"], "auto": True})
-        except Exception:
-            pass
+    """Run the daily loop prompts and recovery checks."""
+    await run_daily_loop_service(app)
 
 async def cron_weekly(app: Application):
     """Send weekly insight summary."""
@@ -1188,51 +1623,46 @@ def _session_msg_goal_line(s): return f"**{s.get('goal','—')}**"
 
 async def cron_sessions_tick(app: Application):
     now_utc = now()
-    # Look at ACTIVE sessions only
     active = list(sessions.find({"state": "ACTIVE"}))
     for s in active:
         uid = s["user_id"]
-        # Ask completion when timebox is up (once)
         ends_at = ensure_aware(s.get("ends_at")) or now_utc
         if now_utc >= ends_at and not s.get("asked_completion", False):
             try:
-                kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Done", callback_data="sess:complete_yes"),
-                     InlineKeyboardButton("⏳ Not yet", callback_data="sess:complete_no")]
-                ])
-                await app.bot.send_message(uid, text=f"⏱️ Time’s up for {_session_msg_goal_line(s)}. Did you finish?", reply_markup=kb, parse_mode="Markdown")
+                await app.bot.send_message(
+                    uid,
+                    text=f"Time's up for {_session_msg_goal_line(s)}. How did it go?",
+                    reply_markup=focus_completion_buttons(),
+                    parse_mode="Markdown",
+                )
                 sessions.update_one({"_id": s["_id"]}, {"$set": {"asked_completion": True}})
             except Exception:
-                pass
+                logger.exception("Session completion prompt failed for user_id=%s", uid)
             continue
 
-        # If still within timebox, handle start/still-working checks
         nca = ensure_aware(s.get("next_check_at"))
-        if not nca or now_utc < nca:
+        if not s.get("nudges_enabled", True) or not nca or now_utc < nca:
             continue
 
         nudges = int(s.get("nudges_sent", 0))
         started = bool(s.get("started_confirmed", False))
 
-        # Build message tone (simple version; we’ll make it spicier later)
         if not started:
             txt = f"🔥 {_session_msg_goal_line(s)} — Did you start?"
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("Yes, I started", callback_data="sess:start_yes"),
                  InlineKeyboardButton("Not yet", callback_data="sess:start_no")]
             ])
-            next_dt = now_utc + timedelta(minutes=5)  # keep pushing every 5 until started
+            next_dt = now_utc + timedelta(minutes=5)
         else:
             txt = f"⚡ {_session_msg_goal_line(s)} — Still in the pocket?"
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("Still working", callback_data="sess:still_yes"),
                  InlineKeyboardButton("I drifted", callback_data="sess:still_no")]
             ])
-            next_dt = now_utc + timedelta(minutes=15)  # rhythm checks
+            next_dt = now_utc + timedelta(minutes=15)
 
-        # Nudge cap to avoid spam (max 4)
         if nudges >= 4 and started:
-            # Back off silently once they’re moving
             sessions.update_one({"_id": s["_id"]}, {"$set": {"next_check_at": next_dt}})
             continue
 
@@ -1240,7 +1670,7 @@ async def cron_sessions_tick(app: Application):
             await app.bot.send_message(uid, text=txt, reply_markup=kb, parse_mode="Markdown")
             sessions.update_one({"_id": s["_id"]}, {"$set": {"next_check_at": next_dt}, "$inc": {"nudges_sent": 1}})
         except Exception:
-            pass
+            logger.exception("Session tick failed for user_id=%s", uid)
 
 # Endpoint to trigger it (like your other cron endpoints)
 @app.get("/cron/sessions-tick")
