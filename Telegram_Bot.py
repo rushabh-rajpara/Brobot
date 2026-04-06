@@ -182,7 +182,7 @@ def ai_reply(prompt: str) -> str:
         return (resp.text or "").strip()
     except Exception:
         logger.exception("Cohere chat failed")
-        return prompt
+        return "Lock in. Pick the smallest useful next step and do it for 2 minutes right now."
 
 def cooldown_active(user_id: int) -> bool:
     s = state.find_one({"user_id": user_id}) or {}
