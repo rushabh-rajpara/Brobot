@@ -29,6 +29,7 @@ import cohere
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+COHERE_MODEL = os.getenv("COHERE_MODEL", "command-r-08-2024")
 TZ = os.getenv("TZ", "America/Toronto")
 TZINFO = ZoneInfo(TZ)
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
@@ -178,10 +179,10 @@ def style_text(tone: str, msg: str) -> str:
 
 def ai_reply(prompt: str) -> str:
     try:
-        resp = co.chat(model="command-r-plus", message=prompt, temperature=0.2)
+        resp = co.chat(model=COHERE_MODEL, message=prompt, temperature=0.2)
         return (resp.text or "").strip()
     except Exception:
-        logger.exception("Cohere chat failed")
+        logger.exception("Cohere chat failed using model %s", COHERE_MODEL)
         return "Lock in. Pick the smallest useful next step and do it for 2 minutes right now."
 
 def cooldown_active(user_id: int) -> bool:
