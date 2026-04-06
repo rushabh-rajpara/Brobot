@@ -88,6 +88,7 @@ COMMON_BLOCKERS = ["overwhelmed", "distracted", "tired", "anxious", "perfectioni
 PUSH_STYLES = ["gentle", "firm", "ruthless"]
 RESTART_SIZES = [5, 10, 15]
 FOCUS_DURATIONS = [5, 10, 15, 25, 45]
+PHRASING_STYLES = ["blunt", "tactical", "calm", "confrontational", "compressed"]
 TIMEZONE_CHOICES = [
     "America/Toronto",
     "America/New_York",
@@ -96,6 +97,15 @@ TIMEZONE_CHOICES = [
     "America/Los_Angeles",
     "UTC",
 ]
+
+MODE_STYLE_CANDIDATES = {
+    "starter": ["compressed", "tactical", "blunt", "calm"],
+    "focus": ["tactical", "compressed", "blunt"],
+    "clarity": ["tactical", "calm", "compressed"],
+    "recovery": ["calm", "tactical", "compressed", "blunt"],
+    "momentum": ["blunt", "compressed", "tactical"],
+    "override": ["compressed", "confrontational", "blunt"],
+}
 
 # =========================
 # UTIL
@@ -255,6 +265,18 @@ def top_bucket(value: Any):
     if not isinstance(value, dict) or not value:
         return None
     return max(value, key=value.get)
+
+def recent_list_memory(user_id: int, key: str, limit: int = 5) -> list[str]:
+    value = get_memory(user_id, key, []) or []
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value[:limit]]
+
+def push_recent_memory(user_id: int, key: str, item: str, *, limit: int = 5, confidence: float = 0.65):
+    items = recent_list_memory(user_id, key, limit=limit)
+    items = [str(item)] + [existing for existing in items if existing != str(item)]
+    set_memory(user_id, key, items[:limit], confidence)
+    return items[:limit]
 
 def record_intervention_outcome(
     user_id: int,
@@ -428,25 +450,32 @@ def ai_reply(prompt: str) -> str:
         return "Lock in. Pick the smallest useful next step and do it for 2 minutes right now."
 
 def phrase_intervention(user_id: int, intervention: Dict[str, Any]) -> str:
-    profile = ensure_profile(user_id)
-    goal = (resolve_current_goal(user_id) or {}).get("goal", "your target")
-    style = profile.get("push_style", "firm")
+    goal = intervention.get("goal") or (resolve_current_goal(user_id) or {}).get("goal", "your target")
+    tone_policy = intervention.get("tone_policy", "firm")
+    phrasing_style = intervention.get("phrasing_style", "tactical")
+    recent_phrases = ", ".join(recent_list_memory(user_id, "recent_phrase_signatures", limit=3)) or "none"
     prompt = (
         f"You are phrasing a deterministic Telegram accountability intervention.\n"
-        f"Push style: {style}.\n"
+        f"Tone policy: {tone_policy}.\n"
+        f"Phrasing style: {phrasing_style}.\n"
         f"Goal: {goal}.\n"
         f"Trigger: {intervention.get('trigger')}.\n"
         f"Mode: {intervention.get('mode')}.\n"
         f"Blocker: {intervention.get('blocker') or 'none'}.\n"
         f"Action: {intervention.get('action')}.\n"
-        "Write 1-2 short Telegram-ready sentences. Do not invent logic or extra options."
+        f"Recent phrase signatures to avoid repeating: {recent_phrases}.\n"
+        "Write 1-2 short Telegram-ready sentences. Keep it sharp, useful, and non-generic. Do not invent logic or extra options."
     )
     try:
         resp = co.chat(model=COHERE_MODEL, message=prompt, temperature=0.2)
-        return (resp.text or "").strip() or intervention.get("action", "Take the smallest next step now.")
+        text = (resp.text or "").strip() or intervention.get("action", "Take the smallest next step now.")
     except Exception:
         logger.exception("Cohere intervention phrasing failed using model %s", COHERE_MODEL)
-        return intervention.get("action", "Take the smallest next step now.")
+        text = intervention.get("action", "Take the smallest next step now.")
+    signature = " ".join(text.lower().split()[:8])
+    push_recent_memory(user_id, "recent_phrasing_styles", phrasing_style, limit=4, confidence=0.7)
+    push_recent_memory(user_id, "recent_phrase_signatures", signature, limit=4, confidence=0.7)
+    return text
 
 def weekly_summary_facts(user_id: int) -> Dict[str, Any]:
     since = now() - timedelta(days=7)
@@ -497,18 +526,21 @@ def weekly_summary_facts(user_id: int) -> Dict[str, Any]:
         "main_blocker_pattern": main_blocker_pattern,
         "what_worked": what_worked,
         "adjustment": adjustment,
+        "top_slump_hour": top_bucket(get_memory(user_id, "time_of_day_slumps", {})) or "none",
+        "effective_style": top_bucket(get_memory(user_id, "effective_intervention_modes", {})) or what_worked,
     }
 
 def phrase_weekly_summary(user_id: int, facts: Dict[str, Any]) -> str:
     wins = ", ".join(facts.get("key_wins") or ["none"])
     prompt = (
-        "Phrase this deterministic weekly accountability summary in 4-6 short lines.\n"
+        "Phrase this deterministic weekly accountability summary in 4-5 short lines.\n"
         f"Days active: {facts.get('days_active', 0)}.\n"
         f"Key wins: {wins}.\n"
         f"Main blocker pattern: {facts.get('main_blocker_pattern', 'none')}.\n"
         f"What worked: {facts.get('what_worked', 'starter')}.\n"
+        f"Top slump hour: {facts.get('top_slump_hour', 'none')}.\n"
         f"Adjustment for next week: {facts.get('adjustment', '')}.\n"
-        "Do not invent facts. Keep it practical."
+        "Do not invent facts. Keep it practical, sharp, and free of generic praise."
     )
     try:
         resp = co.chat(model=COHERE_MODEL, message=prompt, temperature=0.2)
@@ -523,6 +555,7 @@ def phrase_weekly_summary(user_id: int, facts: Dict[str, Any]) -> str:
         f"Key wins: {wins}\n"
         f"Main blocker: {facts.get('main_blocker_pattern', 'none')}\n"
         f"What worked: {facts.get('what_worked', 'starter')}\n"
+        f"Top slump hour: {facts.get('top_slump_hour', 'none')}\n"
         f"Next adjustment: {facts.get('adjustment', '')}"
     )
 
@@ -597,6 +630,75 @@ def detect_blocker(user_id: int, explicit: str | None = None) -> str:
     blockers = profile.get("blockers") or []
     return blockers[0] if blockers else "distracted"
 
+def recent_blocked_sessions(user_id: int, limit: int = 5) -> int:
+    docs = list(logs.find({"user_id": user_id, "kind": "focus_completion"}).sort("ts", DESCENDING).limit(limit))
+    return sum(1 for doc in docs if (doc.get("data") or {}).get("status") == "blocked")
+
+def recent_success_count(user_id: int, limit: int = 5) -> int:
+    docs = list(logs.find({"user_id": user_id, "kind": {"$in": ["done", "focus_completion"]}}).sort("ts", DESCENDING).limit(limit))
+    count = 0
+    for doc in docs:
+        data = doc.get("data") or {}
+        if doc.get("kind") == "done" or data.get("status") in {"done", "partial"}:
+            count += 1
+    return count
+
+def missed_day_severity(user_id: int) -> str:
+    missed = int((users.find_one({"user_id": user_id}) or {}).get("missed_days", 0))
+    if missed >= 4:
+        return "critical"
+    if missed >= 2:
+        return "elevated"
+    return "fresh"
+
+def detect_goal_decay(user_id: int, goal: str | None = None) -> Dict[str, Any]:
+    selected_goal = goal or ((get_today_intention(user_id) or {}).get("selected_goal")) or ((resolve_current_goal(user_id) or {}).get("goal"))
+    if not selected_goal:
+        return {"decayed": False, "goal": None, "severity": "none", "action": None}
+    recent = list(daily_intentions.find({"user_id": user_id, "selected_goal": selected_goal}).sort("updated_at", DESCENDING).limit(7))
+    low_progress = sum(1 for item in recent if item.get("status") in {"missed", "blocked", "partial"})
+    repeated_avoidance = recent_avoidance_count(user_id)
+    if low_progress >= 4 or repeated_avoidance >= 3:
+        return {"decayed": True, "goal": selected_goal, "severity": "replace", "action": "replace"}
+    if low_progress >= 3:
+        return {"decayed": True, "goal": selected_goal, "severity": "split", "action": "split"}
+    if low_progress >= 2:
+        return {"decayed": True, "goal": selected_goal, "severity": "shrink", "action": "shrink"}
+    return {"decayed": False, "goal": selected_goal, "severity": "none", "action": None}
+
+def choose_tone_policy(user_id: int, trigger: str, *, blocker: str | None = None) -> str:
+    recent_success = recent_success_count(user_id)
+    avoidance = recent_avoidance_count(user_id)
+    blocked = recent_blocked_sessions(user_id)
+    severity = missed_day_severity(user_id)
+    low_energy = top_bucket(get_memory(user_id, "time_of_day_slumps", {})) is not None and detect_blocker(user_id, blocker) == "tired"
+    profile_style = ensure_profile(user_id).get("push_style", "firm")
+    if trigger == "override":
+        return "calm"
+    if severity == "critical":
+        return "compressed"
+    if avoidance >= 3 or blocked >= 2:
+        return "confrontational" if profile_style == "ruthless" else "blunt"
+    if low_energy:
+        return "calm"
+    if recent_success >= 3:
+        return "compressed" if profile_style == "firm" else "tactical"
+    return {"gentle": "calm", "firm": "tactical", "ruthless": "blunt"}.get(profile_style, "tactical")
+
+def choose_phrasing_style(user_id: int, mode: str, tone_policy: str) -> str:
+    candidates = list(MODE_STYLE_CANDIDATES.get(mode, ["tactical", "compressed"]))
+    if tone_policy == "confrontational":
+        candidates = ["confrontational", "blunt"] + [c for c in candidates if c not in {"confrontational", "blunt"}]
+    elif tone_policy == "calm":
+        candidates = ["calm", "tactical"] + [c for c in candidates if c not in {"calm", "tactical"}]
+    elif tone_policy == "compressed":
+        candidates = ["compressed", "blunt"] + [c for c in candidates if c not in {"compressed", "blunt"}]
+    recent_styles = recent_list_memory(user_id, "recent_phrasing_styles", limit=3)
+    for style in candidates:
+        if style not in recent_styles[:2]:
+            return style
+    return candidates[0]
+
 def blocker_action(blocker: str, restart_size_min: int, goal: str) -> str:
     if blocker == "overwhelmed":
         return f"Find the smallest visible step for {goal}. Make it obvious and do only that."
@@ -610,6 +712,42 @@ def blocker_action(blocker: str, restart_size_min: int, goal: str) -> str:
         return f"No polishing. Push a rough version of {goal} and stop when it is merely usable."
     return f"Take one useful step on {goal} for {restart_size_min} minutes."
 
+def missed_day_action(user_id: int, goal: str, restart: int) -> str:
+    severity = missed_day_severity(user_id)
+    if severity == "fresh":
+        return f"Yesterday slipped. Reset fast: choose one useful target for {goal} and protect {restart} minutes."
+    if severity == "elevated":
+        return f"This is a streak wobble, not a collapse. Shrink {goal}, ignore extras, and get one honest restart block in."
+    return f"Stop trying to catch up. Today's only job is a tiny restart on {goal}. Everything else waits."
+
+def build_rescue_plan(user_id: int) -> Dict[str, str]:
+    intention = get_today_intention(user_id) or {}
+    goal = intention.get("selected_goal") or (resolve_current_goal(user_id) or {}).get("goal") or "your goal"
+    target = intention.get("target") or f"move {goal} forward"
+    smallest_win = blocker_action(detect_blocker(user_id), 5, goal)
+    restart_minutes = min(int(ensure_profile(user_id).get("restart_size_min", 10)), 10)
+    ignore = "Ignore polishing, side quests, and backlog guilt."
+    follow_up = f"Check back in {restart_minutes} minutes."
+    return {
+        "goal": goal,
+        "only_target": target,
+        "smallest_win": smallest_win,
+        "restart_session": f"Start {restart_minutes} minutes on {goal}.",
+        "ignore": ignore,
+        "follow_up": follow_up,
+    }
+
+def rescue_plan_text(user_id: int) -> str:
+    plan = build_rescue_plan(user_id)
+    return (
+        "Rescue plan\n"
+        f"Only target: {plan['only_target']}\n"
+        f"Smallest acceptable win: {plan['smallest_win']}\n"
+        f"Restart: {plan['restart_session']}\n"
+        f"Ignore: {plan['ignore']}\n"
+        f"Follow-up: {plan['follow_up']}"
+    )
+
 def choose_intervention(user_id: int, trigger: str, *, blocker: str | None = None, session_doc: Dict[str, Any] | None = None) -> Dict[str, Any]:
     profile = ensure_profile(user_id)
     goal_doc = resolve_current_goal(user_id)
@@ -617,6 +755,7 @@ def choose_intervention(user_id: int, trigger: str, *, blocker: str | None = Non
     restart = int(profile.get("restart_size_min", 10))
     blocker_name = detect_blocker(user_id, blocker)
     mode = "starter"
+    decay = detect_goal_decay(user_id, goal)
 
     if trigger == "no_response_after_morning_prompt":
         mode = "starter"
@@ -632,15 +771,28 @@ def choose_intervention(user_id: int, trigger: str, *, blocker: str | None = Non
         mode = "clarity"
     elif trigger == "override":
         mode = "override"
+    elif trigger == "goal_decay":
+        mode = "clarity"
 
     if mode == "clarity":
-        action = f"Pick the next visible win for {goal}. Name one outcome you can finish today and ignore the rest."
+        if decay.get("decayed"):
+            if decay.get("action") == "replace":
+                action = f"{goal} is dragging too much friction. Replace it or switch goals for today."
+            elif decay.get("action") == "split":
+                action = f"{goal} is too heavy as one lump. Split it into a smaller visible chunk."
+            else:
+                action = f"Shrink {goal} until it feels almost too easy to start."
+        else:
+            action = f"Pick the next visible win for {goal}. Name one outcome you can finish today and ignore the rest."
     elif mode == "momentum":
-        action = f"Reset cleanly today. Choose a smaller target for {goal} and protect {restart} minutes for it."
+        action = missed_day_action(user_id, goal, restart) if trigger == "missed_day" else f"Reset cleanly today. Choose a smaller target for {goal} and protect {restart} minutes for it."
     elif mode == "override":
         action = f"Stop spiraling. Breathe, stand up, and do the smallest safe action toward {goal} right now."
     else:
         action = blocker_action(blocker_name, restart, goal)
+
+    tone_policy = choose_tone_policy(user_id, trigger, blocker=blocker_name)
+    phrasing_style = choose_phrasing_style(user_id, mode, tone_policy)
 
     result = {
         "trigger": trigger,
@@ -650,6 +802,9 @@ def choose_intervention(user_id: int, trigger: str, *, blocker: str | None = Non
         "goal": goal,
         "restart_size_min": restart,
         "session_id": str(session_doc["_id"]) if session_doc else None,
+        "tone_policy": tone_policy,
+        "phrasing_style": phrasing_style,
+        "goal_decay": decay,
     }
     return result
 
@@ -693,6 +848,24 @@ def focus_completion_buttons():
          InlineKeyboardButton("Partial", callback_data="sess:end:partial"),
          InlineKeyboardButton("Blocked", callback_data="sess:end:blocked")]
     ])
+
+def premium_action_buttons(user_id: int, intervention: Dict[str, Any]):
+    rows = [
+        [InlineKeyboardButton("Smallest step", callback_data="ux:smallest_step"),
+         InlineKeyboardButton("Start 5 min", callback_data="ux:start5")],
+    ]
+    if len(list_user_goals(user_id)) > 1:
+        rows.append([InlineKeyboardButton("Switch goal", callback_data="ux:switch_goal"),
+                     InlineKeyboardButton("Not this one", callback_data="ux:not_this_one")])
+    decay = intervention.get("goal_decay") or {}
+    if decay.get("decayed"):
+        rows.append([InlineKeyboardButton("Shrink target", callback_data="ux:shrink"),
+                     InlineKeyboardButton("Replace goal", callback_data="ux:replace")])
+    else:
+        rows.append([InlineKeyboardButton("Shrink target", callback_data="ux:shrink"),
+                     InlineKeyboardButton("I'm fried", callback_data="ux:fried")])
+    rows.append([InlineKeyboardButton("Rescue me", callback_data="ux:rescue")])
+    return InlineKeyboardMarkup(rows)
 
 def morning_anchor_buttons():
     return InlineKeyboardMarkup([
@@ -848,6 +1021,15 @@ def morning_summary_text(user_id: int) -> str:
 def render_intervention_text(user_id: int, trigger: str, *, blocker: str | None = None, session_doc: Dict[str, Any] | None = None) -> str:
     intervention = choose_intervention(user_id, trigger, blocker=blocker, session_doc=session_doc)
     return phrase_intervention(user_id, intervention)
+
+def intervention_reply_markup(user_id: int, trigger: str, *, blocker: str | None = None, session_doc: Dict[str, Any] | None = None):
+    return premium_action_buttons(user_id, choose_intervention(user_id, trigger, blocker=blocker, session_doc=session_doc))
+
+def maybe_log_goal_decay(user_id: int, goal: str | None = None):
+    decay = detect_goal_decay(user_id, goal)
+    if decay.get("decayed"):
+        log_event(user_id, "goal_decay", decay)
+    return decay
 
 def focus_started_text(user_id: int, session_doc: Dict[str, Any]) -> str:
     end_local = ensure_aware(session_doc.get("ends_at")) or now()
@@ -1252,6 +1434,60 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "ux:smallest_step":
+        goal = ((get_today_intention(user.id) or {}).get("selected_goal")) or ((resolve_current_goal(user.id) or {}).get("goal")) or "your target"
+        await safe_edit_message_text(query, blocker_action(detect_blocker(user.id), 5, goal), reply_markup=focus_duration_buttons())
+        return
+
+    if data == "ux:start5":
+        goal = ((get_today_intention(user.id) or {}).get("selected_goal")) or ((resolve_current_goal(user.id) or {}).get("goal"))
+        if not goal:
+            await safe_edit_message_text(query, "Set a goal first, then use the 5-minute restart.")
+            return
+        sid = start_session(user.id, 5, goal, nudges_enabled=False, source="ux_start5")
+        session_doc = sessions.find_one({"_id": sid}) or {"goal": goal, "timebox_min": 5, "ends_at": now() + timedelta(minutes=5), "nudges_enabled": False}
+        record_intervention_outcome(user.id, trigger_type="quick_restart", mode="starter", blocker=detect_blocker(user.id), responded=True, session_started=True, progress_occurred=False, issue_repeated=False)
+        await safe_edit_message_text(query, focus_started_text(user.id, session_doc), reply_markup=focus_completion_buttons())
+        return
+
+    if data == "ux:shrink":
+        intention = get_today_intention(user.id) or {}
+        goal = intention.get("selected_goal") or ((resolve_current_goal(user.id) or {}).get("goal"))
+        target = intention.get("target") or (goal and f"move {goal} forward") or "today's target"
+        smaller = f"Smaller target: 1 visible move on {goal}" if goal else "Smaller target: one visible move"
+        upsert_today_intention(user.id, selected_goal=goal, target=smaller, status="active")
+        await safe_edit_message_text(query, f"Target shrunk.\n{smaller}", reply_markup=focus_duration_buttons())
+        return
+
+    if data == "ux:switch_goal":
+        await safe_edit_message_text(query, "Switch goals with one tap.", reply_markup=goals_list_buttons(user.id))
+        return
+
+    if data == "ux:not_this_one":
+        set_profile_conversation(user.id, "intention", "goal_pick", {})
+        await safe_edit_message_text(query, "Pick a different goal for today.", reply_markup=intention_goal_buttons(user.id))
+        return
+
+    if data == "ux:fried":
+        await safe_edit_message_text(
+            query,
+            render_intervention_text(user.id, "repeated_avoidance", blocker="tired"),
+            reply_markup=intervention_reply_markup(user.id, "repeated_avoidance", blocker="tired"),
+        )
+        return
+
+    if data == "ux:rescue":
+        await safe_edit_message_text(query, rescue_plan_text(user.id), reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Start 5 min", callback_data="ux:start5"),
+             InlineKeyboardButton("Switch goal", callback_data="ux:switch_goal")]
+        ]))
+        return
+
+    if data == "ux:replace":
+        set_profile_conversation(user.id, "intention", "goal_pick", {})
+        await safe_edit_message_text(query, "This goal may be decaying. Pick a replacement goal for today.", reply_markup=intention_goal_buttons(user.id))
+        return
+
     if data.startswith("sess:end:"):
         outcome = data.split(":")[2]
         mapped_state = {"done": "DONE", "partial": "DONE", "blocked": "ABORTED"}[outcome]
@@ -1270,9 +1506,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             upsert_today_intention(user.id, status="blocked")
             log_event(user.id, "focus_completion", {"status": "blocked"})
             record_intervention_outcome(user.id, trigger_type="focus_completion", mode="recovery", blocker=detect_blocker(user.id), responded=True, session_started=True, progress_occurred=False, issue_repeated=True)
-            await query.edit_message_text(
+            maybe_log_goal_decay(user.id)
+            await safe_edit_message_text(
+                query,
                 render_intervention_text(user.id, "unfinished_session"),
-                reply_markup=blocker_choice_buttons("recover"),
+                reply_markup=intervention_reply_markup(user.id, "unfinished_session"),
             )
         return
 
@@ -1346,9 +1584,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         upsert_today_intention(user.id, last_blocker=blocker)
         increment_memory_counter(user.id, "goal_friction_patterns", blocker, 1, 0.75)
         record_intervention_outcome(user.id, trigger_type="recovery_choice", mode="recovery", blocker=blocker, responded=True, session_started=False, progress_occurred=False, issue_repeated=True)
-        await query.edit_message_text(
+        maybe_log_goal_decay(user.id)
+        await safe_edit_message_text(
+            query,
             render_intervention_text(user.id, "repeated_avoidance", blocker=blocker),
-            reply_markup=focus_duration_buttons(),
+            reply_markup=intervention_reply_markup(user.id, "repeated_avoidance", blocker=blocker),
         )
         return
 
@@ -1365,7 +1605,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bump_missed(user.id, 1)
             increment_memory_counter(user.id, "time_of_day_slumps", str(local_now_for_user(user.id).hour), 1, 0.75)
             record_intervention_outcome(user.id, trigger_type="eod_check", mode="recovery", responded=True, session_started=False, progress_occurred=False, issue_repeated=True)
-            await query.edit_message_text(render_intervention_text(user.id, "missed_day"))
+            await safe_edit_message_text(
+                query,
+                render_intervention_text(user.id, "missed_day"),
+                reply_markup=intervention_reply_markup(user.id, "missed_day"),
+            )
         elif status == "reset":
             record_intervention_outcome(user.id, trigger_type="eod_check", mode="starter", responded=True, session_started=False, progress_occurred=False, issue_repeated=False)
             await query.edit_message_text("Reset accepted. Tomorrow starts with a clean board.")
@@ -1578,7 +1822,7 @@ def loop_hours_for_user(user_id: int) -> Dict[str, int]:
 async def send_intervention_message(app: Application, user_id: int, trigger: str, *, blocker: str | None = None, session_doc: Dict[str, Any] | None = None, reply_markup=None):
     intervention = choose_intervention(user_id, trigger, blocker=blocker, session_doc=session_doc)
     text = phrase_intervention(user_id, intervention)
-    await app.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
+    await app.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup or premium_action_buttons(user_id, intervention))
     log_structured("intervention_send", user_id=user_id, trigger=trigger, mode=intervention.get("mode"), blocker=intervention.get("blocker"), session_id=str(session_doc["_id"]) if session_doc else None)
     log_event(user_id, "intervention", {"trigger": trigger, "mode": intervention.get("mode"), "blocker": blocker, "session_id": str(session_doc["_id"]) if session_doc else None})
     record_intervention_outcome(
@@ -1609,7 +1853,7 @@ async def run_daily_loop_service(app: Application):
 
             if yesterday.get("status") == "missed" and hour == hours["morning"] and not intention.get("missed_day_recovery_sent_at"):
                 upsert_today_intention(uid, missed_day_recovery_sent_at=now(), morning_prompt_sent_at=intention.get("morning_prompt_sent_at") or now())
-                await send_intervention_message(app, uid, "missed_day", reply_markup=morning_anchor_buttons())
+                await send_intervention_message(app, uid, "missed_day", reply_markup=intervention_reply_markup(uid, "missed_day"))
                 continue
 
             if hour == hours["morning"] and not intention.get("morning_prompt_sent_at"):
@@ -1651,18 +1895,19 @@ async def run_daily_loop_service(app: Application):
 
             if recent_avoidance_count(uid) >= 2 and not intention.get("avoidance_recovery_sent_at"):
                 upsert_today_intention(uid, avoidance_recovery_sent_at=now())
-                await send_intervention_message(app, uid, "repeated_avoidance", reply_markup=blocker_choice_buttons("recover"))
+                await send_intervention_message(app, uid, "repeated_avoidance", reply_markup=intervention_reply_markup(uid, "repeated_avoidance"))
                 continue
 
             goal_updated_at = ensure_aware((current_goal or {}).get("updated_at"))
             if current_goal and goal_updated_at and now() >= goal_updated_at + timedelta(days=7):
                 if not intention and not state_doc.get("stale_goal_sent_at"):
                     state.update_one({"user_id": uid}, {"$set": {"stale_goal_sent_at": now()}}, upsert=True)
+                    maybe_log_goal_decay(uid, current_goal.get("goal"))
                     await send_intervention_message(
                         app,
                         uid,
-                        "stale_goal",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Set today's target", callback_data="intent:begin")]]),
+                        "goal_decay" if detect_goal_decay(uid, current_goal.get("goal")).get("decayed") else "stale_goal",
+                        reply_markup=intervention_reply_markup(uid, "goal_decay" if detect_goal_decay(uid, current_goal.get("goal")).get("decayed") else "stale_goal"),
                     )
         except Exception:
             logger.exception("Daily loop service failed for user_id=%s", uid)
