@@ -213,6 +213,22 @@ def get_goal_by_ref(user_id: int, goal_ref: str, *, include_completed: bool = Fa
         query["goal"] = goal_ref
         return goals.find_one(query)
 
+def get_goal_by_name(user_id: int, goal: str, *, include_completed: bool = False):
+    query = {"user_id": user_id, "goal": goal} if include_completed else {
+        "user_id": user_id,
+        "goal": goal,
+        "$or": [
+            {"status": {"$exists": False}},
+            {"status": {"$in": ["active", "ACTIVE"]}},
+        ],
+    }
+    return goals.find_one(query)
+
+def is_goal_active(user_id: int, goal: str | None) -> bool:
+    if not goal:
+        return False
+    return get_goal_by_name(user_id, goal) is not None
+
 def resolve_current_goal(user_id: int, *, sync_active: bool = True):
     user_doc = users.find_one({"user_id": user_id}) or {}
     active_goal = user_doc.get("active_goal")
@@ -273,12 +289,32 @@ def mark_goal_status(user_id: int, goal: str, status: str):
         updates["completed_at"] = None
     goals.update_one({"user_id": user_id, "goal": goal}, {"$set": updates}, upsert=False)
     if normalized == "done":
+        next_goal_name = None
         if (users.find_one({"user_id": user_id}) or {}).get("active_goal") == goal:
             next_goal = resolve_current_goal(user_id, sync_active=False)
             if next_goal and next_goal.get("goal") != goal:
+                next_goal_name = next_goal["goal"]
                 users.update_one({"user_id": user_id}, {"$set": {"active_goal": next_goal["goal"]}}, upsert=True)
             else:
                 users.update_one({"user_id": user_id}, {"$unset": {"active_goal": ""}})
+        else:
+            next_goal = resolve_current_goal(user_id, sync_active=False)
+            if next_goal and next_goal.get("goal") != goal:
+                next_goal_name = next_goal["goal"]
+        today_intention = get_today_intention(user_id)
+        if today_intention and today_intention.get("selected_goal") == goal:
+            intention_updates: Dict[str, Any] = {
+                "selected_goal": next_goal_name,
+                "updated_at": now(),
+            }
+            if next_goal_name:
+                intention_updates["status"] = "planned"
+                intention_updates["target"] = None
+                intention_updates["fallback"] = None
+            daily_intentions.update_one(
+                {"_id": today_intention["_id"]},
+                {"$set": intention_updates},
+            )
 
 def set_memory(user_id: int, key: str, value: Any, confidence: float = 0.5):
     memory.update_one(
@@ -427,6 +463,14 @@ def ensure_user(user_id: int, name: str):
 def get_current_goal(user_id: int):
     return resolve_current_goal(user_id)
 
+def effective_intention_goal(user_id: int) -> str | None:
+    intention = get_today_intention(user_id) or {}
+    selected_goal = intention.get("selected_goal")
+    if selected_goal and is_goal_active(user_id, selected_goal):
+        return selected_goal
+    current = resolve_current_goal(user_id)
+    return (current or {}).get("goal")
+
 def start_session(user_id: int, timebox_min: int, goal: str | None = None, *, nudges_enabled: bool = True, source: str = "command") -> ObjectId:
     g = goal or ((get_current_goal(user_id) or {}).get("goal"))
     if not g:
@@ -490,7 +534,7 @@ def ai_reply(prompt: str) -> str:
         return "Lock in. Pick the smallest useful next step and do it for 2 minutes right now."
 
 def phrase_intervention(user_id: int, intervention: Dict[str, Any]) -> str:
-    goal = intervention.get("goal") or (resolve_current_goal(user_id) or {}).get("goal", "your target")
+    goal = intervention.get("goal") or effective_intention_goal(user_id) or "your target"
     tone_policy = intervention.get("tone_policy", "firm")
     phrasing_style = intervention.get("phrasing_style", "tactical")
     recent_phrases = ", ".join(recent_list_memory(user_id, "recent_phrase_signatures", limit=3)) or "none"
@@ -692,7 +736,7 @@ def missed_day_severity(user_id: int) -> str:
     return "fresh"
 
 def detect_goal_decay(user_id: int, goal: str | None = None) -> Dict[str, Any]:
-    selected_goal = goal or ((get_today_intention(user_id) or {}).get("selected_goal")) or ((resolve_current_goal(user_id) or {}).get("goal"))
+    selected_goal = goal or effective_intention_goal(user_id)
     if not selected_goal:
         return {"decayed": False, "goal": None, "severity": "none", "action": None}
     recent = list(daily_intentions.find({"user_id": user_id, "selected_goal": selected_goal}).sort("updated_at", DESCENDING).limit(7))
@@ -762,7 +806,7 @@ def missed_day_action(user_id: int, goal: str, restart: int) -> str:
 
 def build_rescue_plan(user_id: int) -> Dict[str, str]:
     intention = get_today_intention(user_id) or {}
-    goal = intention.get("selected_goal") or (resolve_current_goal(user_id) or {}).get("goal") or "your goal"
+    goal = effective_intention_goal(user_id) or "your goal"
     target = intention.get("target") or f"move {goal} forward"
     smallest_win = blocker_action(detect_blocker(user_id), 5, goal)
     restart_minutes = min(int(ensure_profile(user_id).get("restart_size_min", 10)), 10)
@@ -1116,9 +1160,13 @@ def intention_summary(user_id: int) -> str:
     intention = get_today_intention(user_id)
     if not intention:
         return "No daily intention yet."
+    selected_goal = intention.get("selected_goal")
+    if selected_goal and not is_goal_active(user_id, selected_goal):
+        intention = upsert_today_intention(user_id, selected_goal=None)
+        selected_goal = None
     return (
         f"Today's intention ({intention['date']})\n"
-        f"Goal: {intention.get('selected_goal') or '—'}\n"
+        f"Goal: {selected_goal or '—'}\n"
         f"Target: {intention.get('target') or '—'}\n"
         f"Fallback: {intention.get('fallback') or '—'}\n"
         f"Status: {intention.get('status') or 'planned'}"
@@ -1159,7 +1207,7 @@ async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(user.id, user.full_name or user.username or "human")
     touch_user(user.id, "command:focus")
     if not context.args:
-        goal = ((get_today_intention(user.id) or {}).get("selected_goal")) or ((resolve_current_goal(user.id) or {}).get("goal"))
+        goal = effective_intention_goal(user.id)
         if not goal:
             return await update.message.reply_text("Set a goal first with /settings or /goals.")
         return await update.message.reply_text(f"Pick a focus duration for {goal}.", reply_markup=focus_duration_buttons())
@@ -1462,8 +1510,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "focus:begin":
-        current = get_today_intention(user.id) or {}
-        goal = current.get("selected_goal") or (resolve_current_goal(user.id) or {}).get("goal")
+        goal = effective_intention_goal(user.id)
         if not goal:
             await query.edit_message_text("Set a goal first, then come back to focus.")
             return
@@ -1483,8 +1530,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, _, nudges_value, minutes_value = data.split(":")
         minutes = int(minutes_value)
         nudges_enabled = nudges_value == "on"
-        current = get_today_intention(user.id) or {}
-        goal = current.get("selected_goal") or (resolve_current_goal(user.id) or {}).get("goal")
+        goal = effective_intention_goal(user.id)
         if not goal:
             await query.edit_message_text("Set a goal first, then start a focus session.")
             return
@@ -1509,12 +1555,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "ux:smallest_step":
-        goal = ((get_today_intention(user.id) or {}).get("selected_goal")) or ((resolve_current_goal(user.id) or {}).get("goal")) or "your target"
+        goal = effective_intention_goal(user.id) or "your target"
         await safe_edit_message_text(query, blocker_action(detect_blocker(user.id), 5, goal), reply_markup=focus_duration_buttons())
         return
 
     if data == "ux:start5":
-        goal = ((get_today_intention(user.id) or {}).get("selected_goal")) or ((resolve_current_goal(user.id) or {}).get("goal"))
+        goal = effective_intention_goal(user.id)
         if not goal:
             await safe_edit_message_text(query, "Set a goal first, then use the 5-minute restart.")
             return
@@ -1526,7 +1572,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "ux:shrink":
         intention = get_today_intention(user.id) or {}
-        goal = intention.get("selected_goal") or ((resolve_current_goal(user.id) or {}).get("goal"))
+        goal = effective_intention_goal(user.id)
         target = intention.get("target") or (goal and f"move {goal} forward") or "today's target"
         smaller = f"Smaller target: 1 visible move on {goal}" if goal else "Smaller target: one visible move"
         upsert_today_intention(user.id, selected_goal=goal, target=smaller, status="active")
@@ -1865,7 +1911,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text(nudge)
 
     g = resolve_current_goal(user.id)
-    goal = g["goal"] if g else "—"
+    goal = effective_intention_goal(user.id) or (g["goal"] if g else "—")
     prompt = (
         f"User said: '{txt}'.\n"
         f"Current focus goal: '{goal}'.\n"
