@@ -45,15 +45,7 @@ Primary command surface:
 - `/override`
 - `/settings`
 
-Backward-compatible legacy commands still exist:
-
-- `/setgoal`
-- `/setactive`
-- `/checkintime`
-- `/checkin`
-- `/stats`
-
-These older commands are kept for compatibility, but the intended setup flow is now button-first through `/start` and `/settings`.
+The bot is intentionally button-first now. Setup, daily intention, timing, and goal management should happen through `/start`, `/settings`, `/goals`, and inline buttons rather than older slash-command setup flows.
 
 ## Architecture Notes
 

@@ -1220,7 +1220,7 @@ async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     g = get_current_goal(user.id)
     if not g:
-        return await update.message.reply_text("Set a goal first: /setgoal <goal> <why>")
+        return await update.message.reply_text("Set a goal first in /settings, then come back to focus.")
 
     try:
         sid = start_session(user.id, mins, g["goal"], nudges_enabled=True, source="command")
@@ -1236,7 +1236,7 @@ async def cmd_setgoal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(user.id, user.full_name or "")
     touch_user(user.id, "command:setgoal")
     if not context.args or len(context.args) < 2:
-        return await update.message.reply_text("Legacy setup command. Use /settings for the button-first flow, or `/setgoal <goal> <your reason>` for compatibility.", parse_mode="Markdown")
+        return await update.message.reply_text("Goal setup now lives in /settings.")
     goal = context.args[0].lower()
     why = " ".join(context.args[1:])
     set_goal_why(user.id, goal, why)
@@ -1245,18 +1245,18 @@ async def cmd_setgoal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not u.get("active_goal"):
         users.update_one({"user_id": user.id}, {"$set": {"active_goal": goal}}, upsert=True)
     log_event(user.id, "why", {"goal": goal})
-    await update.message.reply_text(f"Saved: {goal} → “{why}”. Active goal: {goal}. Use /checkin to start.")
+    await update.message.reply_text(f"Saved: {goal} → “{why}”. Active goal: {goal}. Use /start or /settings to continue.")
 
 async def cmd_setactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.full_name or "")
     touch_user(user.id, "command:setactive")
     if not context.args:
-        return await update.message.reply_text("Legacy setup command. Use /goals to switch with buttons, or `/setactive <goal>` for compatibility.", parse_mode="Markdown")
+        return await update.message.reply_text("Use /goals to switch goals with buttons.")
     goal = context.args[0].lower()
     ok = set_active_goal(user.id, goal)
     if not ok:
-        return await update.message.reply_text(f"No such goal: {goal}. Use /goals to see yours.")
+        return await update.message.reply_text(f"No such active goal: {goal}. Use /goals to see your current list.")
     await update.message.reply_text(f"Active goal set to: {goal}")
 
 async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1266,8 +1266,8 @@ async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not items:
         completed_count = goals.count_documents({"user_id": user.id, "status": "done"})
         if completed_count:
-            return await update.message.reply_text("No active goals right now. Finished goals are hidden from this list. Add a new one in /settings or with `/setgoal <goal> <why>`.", parse_mode="Markdown")
-        return await update.message.reply_text("No goals yet. Add one: /setgoal <goal> <why>")
+            return await update.message.reply_text("No active goals right now. Finished goals are hidden from this list. Add a fresh one in /settings.")
+        return await update.message.reply_text("No goals yet. Add your first one in /settings.")
     u = users.find_one({"user_id": user.id}) or {}
     active = u.get("active_goal")
     lst = "\n".join([f"• {g['goal']}" + ("  ← active" if g['goal']==active else "") for g in items])
@@ -1277,7 +1277,7 @@ async def cmd_checkintime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     touch_user(user.id, "command:checkintime")
     if not context.args:
-        return await update.message.reply_text("Legacy settings command. Prefer /settings, or use `/checkintime <hour 0-23>` for compatibility.", parse_mode="Markdown")
+        return await update.message.reply_text("Timing now lives in /settings.")
     try:
         hour = int(context.args[0])
         if not (0 <= hour <= 23):
@@ -1299,7 +1299,7 @@ async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_user(user.id, "command:checkin")
     g = resolve_current_goal(user.id)
     if not g:
-        return await update.message.reply_text("Set a goal first: /setgoal <goal> <why>")
+        return await update.message.reply_text("Set a goal first in /settings.")
     upsert_today_intention(user.id, selected_goal=g["goal"])
     state.update_one({"user_id": user.id}, {"$set": {"last_checkin": now()}}, upsert=True)
     await update.message.reply_text(
@@ -1334,7 +1334,7 @@ async def cmd_override(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_user(user.id, "command:override")
     g = resolve_current_goal(user.id)
     if not g:
-        return await update.message.reply_text("Set a goal first: /setgoal <goal> <why>")
+        return await update.message.reply_text("Set a goal first in /settings.")
     await run_override(user.id, g["goal"], context)
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1354,9 +1354,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not items:
             completed_count = goals.count_documents({"user_id": user.id, "status": "done"})
             if completed_count:
-                await safe_edit_message_text(query, "No active goals right now. Finished goals are hidden here. Add a fresh one in /settings or with `/setgoal <goal> <why>`.", parse_mode="Markdown")
+                await safe_edit_message_text(query, "No active goals right now. Finished goals are hidden here. Add a fresh one in /settings.")
             else:
-                await safe_edit_message_text(query, "No goals yet. Add one with /settings or `/setgoal <goal> <why>`.", parse_mode="Markdown")
+                await safe_edit_message_text(query, "No goals yet. Add one in /settings.")
         else:
             active = (users.find_one({"user_id": user.id}) or {}).get("active_goal")
             lst = "\n".join([f"• {g['goal']}" + ("  ← active" if g['goal'] == active else "") for g in items])
@@ -1455,7 +1455,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "intent:begin":
         current = resolve_current_goal(user.id)
         if not current:
-            await query.edit_message_text("Set at least one goal first with /setgoal <goal> <why>.")
+            await query.edit_message_text("Set at least one goal first in /settings.")
             return
         goals_for_user = list_user_goals(user.id)
         if len(goals_for_user) == 1:
@@ -1672,7 +1672,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "loop:morning:choose":
         current = resolve_current_goal(user.id)
         if not current:
-            await query.edit_message_text("Set a goal first with /setgoal <goal> <why>.")
+            await query.edit_message_text("Set a goal first in /settings.")
             return
         upsert_today_intention(user.id, selected_goal=current["goal"], morning_choice="you_choose", morning_response_at=now(), status="planned")
         set_profile_conversation(user.id, "intention", "target_text", {"selected_goal": current["goal"]})
@@ -2137,12 +2137,7 @@ tg_app: Application = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(T
 # Handlers
 tg_app.add_handler(CommandHandler("start", cmd_start))
 tg_app.add_handler(CommandHandler("settings", cmd_settings))
-tg_app.add_handler(CommandHandler("setgoal", cmd_setgoal))
-tg_app.add_handler(CommandHandler("checkintime", cmd_checkintime))
-tg_app.add_handler(CommandHandler("checkin", cmd_checkin))
-tg_app.add_handler(CommandHandler("stats", cmd_stats))
 tg_app.add_handler(CommandHandler("override", cmd_override))
-tg_app.add_handler(CommandHandler("setactive", cmd_setactive))
 tg_app.add_handler(CommandHandler("goals", cmd_goals))
 tg_app.add_handler(CommandHandler("focus", cmd_focus))
 
