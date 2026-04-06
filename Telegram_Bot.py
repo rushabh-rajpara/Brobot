@@ -61,6 +61,8 @@ sessions = db["sessions"]  # { user_id, goal, state, timebox_min, started_at, en
 events   = db["events"]    # optional: raw passive events you’ll ingest later
 profiles = db["profiles"]  # { user_id, timezone, push_style, work_start_hour, blockers, restart_size_min, onboarding_complete, conversation, created_at, updated_at }
 daily_intentions = db["daily_intentions"]  # { user_id, date, selected_goal, target, fallback, status, timezone, created_at, updated_at }
+memory = db["memory"]  # { user_id, key, value, confidence, updated_at }
+intervention_outcomes = db["intervention_outcomes"]  # { user_id, ts, trigger_type, mode, blocker, responded, session_started, progress_occurred, issue_repeated, intervention_key }
 
 started_confirmed: bool
 nudges_sent: int
@@ -79,6 +81,8 @@ sessions.create_index([("user_id", ASCENDING), ("state", ASCENDING), ("started_a
 events.create_index([("user_id", ASCENDING), ("ts", DESCENDING)])
 profiles.create_index([("user_id", ASCENDING)], unique=True)
 daily_intentions.create_index([("user_id", ASCENDING), ("date", ASCENDING)], unique=True)
+memory.create_index([("user_id", ASCENDING), ("key", ASCENDING)], unique=True)
+intervention_outcomes.create_index([("user_id", ASCENDING), ("ts", DESCENDING)])
 
 COMMON_BLOCKERS = ["overwhelmed", "distracted", "tired", "anxious", "perfectionist"]
 PUSH_STYLES = ["gentle", "firm", "ruthless"]
@@ -134,11 +138,19 @@ def ensure_profile(user_id: int, name: str = "") -> Dict[str, Any]:
         }},
         upsert=True
     )
-    return get_profile(user_id)
+    profile = get_profile(user_id)
+    if profile.get("push_style"):
+        set_memory(user_id, "preferred_tone", profile.get("push_style"), 0.9)
+    return profile
 
 def set_profile_fields(user_id: int, **fields):
     fields["updated_at"] = now()
     profiles.update_one({"user_id": user_id}, {"$set": fields}, upsert=True)
+    if "push_style" in fields:
+        set_memory(user_id, "preferred_tone", fields["push_style"], 0.95)
+    if "blockers" in fields and isinstance(fields["blockers"], list):
+        counts = {b: 1 for b in fields["blockers"]}
+        set_memory(user_id, "common_blockers", counts, 0.7)
 
 def set_profile_conversation(user_id: int, kind: str, step: str, data: Dict[str, Any] | None = None):
     set_profile_fields(user_id, conversation={"kind": kind, "step": step, "data": data or {}})
@@ -218,10 +230,70 @@ def upsert_today_intention(user_id: int, **fields):
     )
     return get_today_intention(user_id)
 
+def set_memory(user_id: int, key: str, value: Any, confidence: float = 0.5):
+    memory.update_one(
+        {"user_id": user_id, "key": key},
+        {"$set": {"value": value, "confidence": float(confidence), "updated_at": now()}},
+        upsert=True,
+    )
+
+def get_memory(user_id: int, key: str, default=None):
+    doc = memory.find_one({"user_id": user_id, "key": key})
+    if not doc:
+        return default
+    return doc.get("value", default)
+
+def increment_memory_counter(user_id: int, key: str, bucket: str, amount: int = 1, confidence: float = 0.6):
+    current = get_memory(user_id, key, {}) or {}
+    if not isinstance(current, dict):
+        current = {}
+    current[bucket] = int(current.get(bucket, 0)) + amount
+    set_memory(user_id, key, current, confidence)
+    return current
+
+def top_bucket(value: Any):
+    if not isinstance(value, dict) or not value:
+        return None
+    return max(value, key=value.get)
+
+def record_intervention_outcome(
+    user_id: int,
+    *,
+    trigger_type: str,
+    mode: str,
+    blocker: str | None = None,
+    responded: bool = False,
+    session_started: bool = False,
+    progress_occurred: bool = False,
+    issue_repeated: bool = False,
+):
+    doc = {
+        "user_id": user_id,
+        "ts": now(),
+        "trigger_type": trigger_type,
+        "mode": mode,
+        "blocker": blocker,
+        "responded": bool(responded),
+        "session_started": bool(session_started),
+        "progress_occurred": bool(progress_occurred),
+        "issue_repeated": bool(issue_repeated),
+        "intervention_key": f"{trigger_type}:{mode}:{blocker or 'none'}",
+    }
+    intervention_outcomes.insert_one(doc)
+    if blocker:
+        increment_memory_counter(user_id, "blocker_patterns", blocker, 1, 0.7)
+    if progress_occurred:
+        increment_memory_counter(user_id, "effective_intervention_modes", mode, 1, 0.8)
+    if issue_repeated:
+        increment_memory_counter(user_id, "goal_friction_patterns", blocker or trigger_type, 1, 0.65)
+    return doc
+
 def touch_user(user_id: int, source: str):
     ts = now()
     state.update_one({"user_id": user_id}, {"$set": {"last_user_touch_at": ts}}, upsert=True)
     set_profile_fields(user_id, last_user_touch_at=ts, last_user_touch_source=source)
+    local_hour = local_now_for_user(user_id).hour
+    increment_memory_counter(user_id, "time_of_day_activity", str(local_hour), 1, 0.55)
 
 def get_state(user_id: int) -> Dict[str, Any]:
     return state.find_one({"user_id": user_id}) or {}
@@ -355,6 +427,84 @@ def phrase_intervention(user_id: int, intervention: Dict[str, Any]) -> str:
     except Exception:
         logger.exception("Cohere intervention phrasing failed using model %s", COHERE_MODEL)
         return intervention.get("action", "Take the smallest next step now.")
+
+def weekly_summary_facts(user_id: int) -> Dict[str, Any]:
+    since = now() - timedelta(days=7)
+    week_intentions = list(daily_intentions.find({"user_id": user_id, "updated_at": {"$gte": since}}).sort("date", ASCENDING))
+    week_logs = list(logs.find({"user_id": user_id, "ts": {"$gte": since}}).sort("ts", ASCENDING))
+    week_outcomes = list(intervention_outcomes.find({"user_id": user_id, "ts": {"$gte": since}}))
+
+    active_statuses = {"active", "partial", "done", "reset_tomorrow"}
+    days_active = sum(1 for item in week_intentions if item.get("status") in active_statuses)
+    done_goals = [item.get("selected_goal") for item in week_intentions if item.get("status") == "done" and item.get("selected_goal")]
+    key_wins = list(dict.fromkeys(done_goals))[:3]
+
+    blocker_counts: Dict[str, int] = {}
+    for outcome in week_outcomes:
+        blocker = outcome.get("blocker")
+        if blocker:
+            blocker_counts[blocker] = blocker_counts.get(blocker, 0) + 1
+    for entry in week_logs:
+        if entry.get("kind") == "loop_status":
+            status = (entry.get("data") or {}).get("status")
+            if status in {"avoiding", "missed"}:
+                blocker_counts[status] = blocker_counts.get(status, 0) + 1
+    main_blocker_pattern = max(blocker_counts, key=blocker_counts.get) if blocker_counts else "none"
+
+    worked_counts: Dict[str, int] = {}
+    for outcome in week_outcomes:
+        if outcome.get("progress_occurred"):
+            mode = outcome.get("mode") or "unknown"
+            worked_counts[mode] = worked_counts.get(mode, 0) + 1
+    what_worked = max(worked_counts, key=worked_counts.get) if worked_counts else "starter"
+
+    if main_blocker_pattern == "overwhelmed":
+        adjustment = "Shrink tomorrow's target before you start."
+    elif main_blocker_pattern == "distracted":
+        adjustment = "Use a short focus block earlier in the day."
+    elif main_blocker_pattern in {"tired", "missed"}:
+        adjustment = "Plan a 5-minute restart instead of a full push."
+    elif main_blocker_pattern == "anxious":
+        adjustment = "Commit to an ugly first draft before polishing."
+    elif main_blocker_pattern == "perfectionist":
+        adjustment = "Ship rough work sooner and forbid polishing."
+    else:
+        adjustment = "Repeat the smallest restart that worked best this week."
+
+    return {
+        "days_active": days_active,
+        "key_wins": key_wins,
+        "main_blocker_pattern": main_blocker_pattern,
+        "what_worked": what_worked,
+        "adjustment": adjustment,
+    }
+
+def phrase_weekly_summary(user_id: int, facts: Dict[str, Any]) -> str:
+    wins = ", ".join(facts.get("key_wins") or ["none"])
+    prompt = (
+        "Phrase this deterministic weekly accountability summary in 4-6 short lines.\n"
+        f"Days active: {facts.get('days_active', 0)}.\n"
+        f"Key wins: {wins}.\n"
+        f"Main blocker pattern: {facts.get('main_blocker_pattern', 'none')}.\n"
+        f"What worked: {facts.get('what_worked', 'starter')}.\n"
+        f"Adjustment for next week: {facts.get('adjustment', '')}.\n"
+        "Do not invent facts. Keep it practical."
+    )
+    try:
+        resp = co.chat(model=COHERE_MODEL, message=prompt, temperature=0.2)
+        text = (resp.text or "").strip()
+        if text:
+            return text
+    except Exception:
+        logger.exception("Cohere weekly summary phrasing failed using model %s", COHERE_MODEL)
+    return (
+        "Weekly summary\n"
+        f"Days active: {facts.get('days_active', 0)}\n"
+        f"Key wins: {wins}\n"
+        f"Main blocker: {facts.get('main_blocker_pattern', 'none')}\n"
+        f"What worked: {facts.get('what_worked', 'starter')}\n"
+        f"Next adjustment: {facts.get('adjustment', '')}"
+    )
 
 def cooldown_active(user_id: int) -> bool:
     s = state.find_one({"user_id": user_id}) or {}
@@ -1039,6 +1189,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         next_check = now() + timedelta(minutes=5)
         sessions.update_one({"_id": sid}, {"$set": {"next_check_at": next_check if nudges_enabled else None}})
         session_doc = sessions.find_one({"_id": sid}) or {"goal": goal, "timebox_min": minutes, "ends_at": now() + timedelta(minutes=minutes), "nudges_enabled": nudges_enabled}
+        record_intervention_outcome(
+            user.id,
+            trigger_type="focus_button_start",
+            mode="focus",
+            blocker=None,
+            responded=True,
+            session_started=True,
+            progress_occurred=False,
+            issue_repeated=False,
+        )
         await query.edit_message_text(
             focus_started_text(user.id, session_doc),
             reply_markup=focus_completion_buttons(),
@@ -1052,14 +1212,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if outcome == "done":
             upsert_today_intention(user.id, status="done")
             log_event(user.id, "focus_completion", {"status": "done"})
+            record_intervention_outcome(user.id, trigger_type="focus_completion", mode="focus", responded=True, session_started=True, progress_occurred=True, issue_repeated=False)
             await query.edit_message_text("Session logged as done. Keep the momentum.")
         elif outcome == "partial":
             upsert_today_intention(user.id, status="partial")
             log_event(user.id, "focus_completion", {"status": "partial"})
+            record_intervention_outcome(user.id, trigger_type="focus_completion", mode="momentum", responded=True, session_started=True, progress_occurred=True, issue_repeated=False)
             await query.edit_message_text("Partial counts. Keep the useful pieces and reset clean.")
         else:
             upsert_today_intention(user.id, status="blocked")
             log_event(user.id, "focus_completion", {"status": "blocked"})
+            record_intervention_outcome(user.id, trigger_type="focus_completion", mode="recovery", blocker=detect_blocker(user.id), responded=True, session_started=True, progress_occurred=False, issue_repeated=True)
             await query.edit_message_text(
                 render_intervention_text(user.id, "unfinished_session"),
                 reply_markup=blocker_choice_buttons("recover"),
@@ -1106,12 +1269,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "loop:midday:started":
         upsert_today_intention(user.id, status="active", midday_status="started", midday_response_at=now())
         log_event(user.id, "loop_status", {"phase": "midday", "status": "started"})
+        record_intervention_outcome(user.id, trigger_type="midday_check", mode="momentum", responded=True, session_started=False, progress_occurred=True, issue_repeated=False)
         await query.edit_message_text("Good. Protect the next block and keep moving.", reply_markup=focus_duration_buttons())
         return
 
     if data == "loop:midday:almost":
         upsert_today_intention(user.id, status="active", midday_status="almost", midday_response_at=now())
         log_event(user.id, "loop_status", {"phase": "midday", "status": "almost"})
+        record_intervention_outcome(user.id, trigger_type="midday_check", mode="focus", responded=True, session_started=False, progress_occurred=False, issue_repeated=False)
         await query.edit_message_text(
             render_intervention_text(user.id, "inactivity_after_target"),
             reply_markup=focus_duration_buttons(),
@@ -1121,6 +1286,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "loop:midday:avoiding":
         upsert_today_intention(user.id, midday_status="avoiding", midday_response_at=now())
         log_event(user.id, "loop_status", {"phase": "midday", "status": "avoiding"})
+        increment_memory_counter(user.id, "time_of_day_slumps", str(local_now_for_user(user.id).hour), 1, 0.7)
+        record_intervention_outcome(user.id, trigger_type="midday_check", mode="recovery", responded=True, session_started=False, progress_occurred=False, issue_repeated=True)
         await query.edit_message_text(
             "Name the blocker so I can give you the right restart.",
             reply_markup=blocker_choice_buttons("recover"),
@@ -1130,6 +1297,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("recover:blocker:"):
         blocker = data.split(":")[2]
         upsert_today_intention(user.id, last_blocker=blocker)
+        increment_memory_counter(user.id, "goal_friction_patterns", blocker, 1, 0.75)
+        record_intervention_outcome(user.id, trigger_type="recovery_choice", mode="recovery", blocker=blocker, responded=True, session_started=False, progress_occurred=False, issue_repeated=True)
         await query.edit_message_text(
             render_intervention_text(user.id, "repeated_avoidance", blocker=blocker),
             reply_markup=focus_duration_buttons(),
@@ -1143,13 +1312,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log_event(user.id, "loop_status", {"phase": "eod", "status": mapped})
         if status == "done":
             bump_streak(user.id, 1)
+            record_intervention_outcome(user.id, trigger_type="eod_check", mode="momentum", responded=True, session_started=False, progress_occurred=True, issue_repeated=False)
             await query.edit_message_text("Logged done. Bank the win and protect tomorrow.")
         elif status == "missed":
             bump_missed(user.id, 1)
+            increment_memory_counter(user.id, "time_of_day_slumps", str(local_now_for_user(user.id).hour), 1, 0.75)
+            record_intervention_outcome(user.id, trigger_type="eod_check", mode="recovery", responded=True, session_started=False, progress_occurred=False, issue_repeated=True)
             await query.edit_message_text(render_intervention_text(user.id, "missed_day"))
         elif status == "reset":
+            record_intervention_outcome(user.id, trigger_type="eod_check", mode="starter", responded=True, session_started=False, progress_occurred=False, issue_repeated=False)
             await query.edit_message_text("Reset accepted. Tomorrow starts with a clean board.")
         else:
+            record_intervention_outcome(user.id, trigger_type="eod_check", mode="momentum", responded=True, session_started=False, progress_occurred=True, issue_repeated=False)
             await query.edit_message_text("Partial logged. Keep the useful residue and come back tomorrow.")
         return
 
@@ -1303,6 +1477,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             goal = data.get("selected_goal")
             target = data.get("target")
             upsert_today_intention(user.id, selected_goal=goal, target=target, fallback=txt, status="active")
+            increment_memory_counter(user.id, "goal_friction_patterns", goal, 1, 0.55)
             clear_profile_conversation(user.id)
             intention = get_today_intention(user.id) or {}
             return await update.message.reply_text(
@@ -1354,9 +1529,20 @@ def loop_hours_for_user(user_id: int) -> Dict[str, int]:
     }
 
 async def send_intervention_message(app: Application, user_id: int, trigger: str, *, blocker: str | None = None, session_doc: Dict[str, Any] | None = None, reply_markup=None):
-    text = render_intervention_text(user_id, trigger, blocker=blocker, session_doc=session_doc)
+    intervention = choose_intervention(user_id, trigger, blocker=blocker, session_doc=session_doc)
+    text = phrase_intervention(user_id, intervention)
     await app.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
-    log_event(user_id, "intervention", {"trigger": trigger, "blocker": blocker, "session_id": str(session_doc["_id"]) if session_doc else None})
+    log_event(user_id, "intervention", {"trigger": trigger, "mode": intervention.get("mode"), "blocker": blocker, "session_id": str(session_doc["_id"]) if session_doc else None})
+    record_intervention_outcome(
+        user_id,
+        trigger_type=trigger,
+        mode=intervention.get("mode", "starter"),
+        blocker=intervention.get("blocker"),
+        responded=False,
+        session_started=False,
+        progress_occurred=False,
+        issue_repeated=trigger in {"repeated_avoidance", "missed_day"},
+    )
 
 async def run_daily_loop_service(app: Application):
     now_utc = dt.datetime.now(dt.timezone.utc)
@@ -1441,33 +1627,17 @@ async def cron_daily(app: Application):
     await run_daily_loop_service(app)
 
 async def cron_weekly(app: Application):
-    """Send weekly insight summary."""
-    one_week = now() - timedelta(days=7)
+    """Send a deterministic weekly summary phrased by AI."""
     for u in users.find({}):
         uid = u["user_id"]
-        week = list(logs.find({"user_id": uid, "ts": {"$gte": one_week}}))
-        done = sum(1 for L in week if L["kind"] == "done")
-        skip = sum(1 for L in week if L["kind"] == "skip")
-        mood_counts: Dict[str, int] = {}
-        for L in week:
-            if L["kind"] == "mood":
-                m = (L.get("data") or {}).get("mood")
-                if m:
-                    mood_counts[m] = mood_counts.get(m, 0) + 1
-        top_mood = max(mood_counts, key=mood_counts.get) if mood_counts else "n/a"
-
-        msg = (
-            "📊 Weekly Insight\n"
-            f"• Done: {done} | Skips: {skip}\n"
-            f"• Most frequent state: {top_mood}\n"
-            "• Suggestion: stack your hardest task right after your natural energy peak.\n"
-            "Reply /stats for recent events."
-        )
         try:
+            facts = weekly_summary_facts(uid)
+            msg = phrase_weekly_summary(uid, facts)
             await app.bot.send_message(chat_id=uid, text=msg)
-            log_event(uid, "insight", {"done": done, "skip": skip, "top_mood": top_mood})
+            log_event(uid, "insight", facts)
+            set_memory(uid, "last_weekly_summary", facts, 0.85)
         except Exception:
-            pass
+            logger.exception("Weekly summary failed for user_id=%s", uid)
 
 # =========================
 # FASTAPI WIRING
