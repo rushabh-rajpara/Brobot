@@ -165,6 +165,12 @@ def today_key_for_user(user_id: int) -> str:
 def list_user_goals(user_id: int):
     return list(goals.find({"user_id": user_id}).sort([("updated_at", DESCENDING), ("goal", ASCENDING)]))
 
+def get_goal_by_ref(user_id: int, goal_ref: str):
+    try:
+        return goals.find_one({"_id": ObjectId(goal_ref), "user_id": user_id})
+    except Exception:
+        return goals.find_one({"user_id": user_id, "goal": goal_ref})
+
 def resolve_current_goal(user_id: int, *, sync_active: bool = True):
     user_doc = users.find_one({"user_id": user_id}) or {}
     active_goal = user_doc.get("active_goal")
@@ -376,17 +382,17 @@ def get_active_goal(user_id: int):
     return resolve_current_goal(user_id)
 
 def set_active_goal(user_id: int, goal: str) -> bool:
-    g = goals.find_one({"user_id": user_id, "goal": goal})
+    g = get_goal_by_ref(user_id, goal)
     if not g:
         return False
-    users.update_one({"user_id": user_id}, {"$set": {"active_goal": goal}}, upsert=True)
+    users.update_one({"user_id": user_id}, {"$set": {"active_goal": g["goal"]}}, upsert=True)
     return True
 
 def goals_list_buttons(user_id: int):
     items = list_user_goals(user_id)
     rows = []
     for g in items:
-        rows.append([InlineKeyboardButton(f"Set active: {g['goal']}", callback_data=f"active:{g['goal']}")])
+        rows.append([InlineKeyboardButton(f"Set active: {g['goal']}", callback_data=f"active:{str(g['_id'])}")])
     return InlineKeyboardMarkup(rows or [[InlineKeyboardButton("No goals set", callback_data="noop")]])
 
 def start_menu_buttons(user_id: int):
@@ -451,7 +457,7 @@ def restart_size_buttons():
 
 def intention_goal_buttons(user_id: int):
     items = list_user_goals(user_id)
-    rows = [[InlineKeyboardButton(g["goal"], callback_data=f"intent:goal:{g['goal']}")] for g in items[:3]]
+    rows = [[InlineKeyboardButton(g["goal"], callback_data=f"intent:goal:{str(g['_id'])}")] for g in items[:3]]
     return InlineKeyboardMarkup(rows or [[InlineKeyboardButton("No goals yet", callback_data="noop")]])
 
 def intention_done_buttons():
@@ -751,10 +757,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("intent:goal:"):
-        goal = data.split(":", 2)[2]
+        goal_ref = data.split(":", 2)[2]
+        goal_doc = get_goal_by_ref(user.id, goal_ref)
+        if not goal_doc:
+            await query.edit_message_text("I couldn't match that goal. Open the intention flow again and pick one more time.")
+            return
+        goal = goal_doc["goal"]
         upsert_today_intention(user.id, selected_goal=goal, status="planned")
         set_profile_conversation(user.id, "intention", "target_text", {"selected_goal": goal})
-        await query.edit_message_text(f"What's today's target for **{goal}**?", parse_mode="Markdown")
+        await query.edit_message_text(f"What's today's target for {goal}?")
         return
 
     if data.startswith("intent:status:"):
@@ -808,10 +819,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Set active goal from inline button
     if data.startswith("active:"):
-        goal = data.split(":")[1]
-        if set_active_goal(user.id, goal):
-            upsert_today_intention(user.id, selected_goal=goal)
-            await query.edit_message_text(f"Active goal set to: {goal}")
+        goal_ref = data.split(":")[1]
+        goal_doc = get_goal_by_ref(user.id, goal_ref)
+        if goal_doc and set_active_goal(user.id, goal_ref):
+            upsert_today_intention(user.id, selected_goal=goal_doc["goal"])
+            await query.edit_message_text(f"Active goal set to: {goal_doc['goal']}")
         else:
             await query.edit_message_text("Could not set active goal.")
         return
