@@ -315,6 +315,26 @@ def recent_avoidance_count(user_id: int) -> int:
 def get_active_session(user_id: int):
     return sessions.find_one({"user_id": user_id, "state": "ACTIVE"}, sort=[("started_at", DESCENDING)])
 
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+def count_docs(collection, query: Dict[str, Any]) -> int:
+    try:
+        return collection.count_documents(query)
+    except Exception:
+        return 0
+
+def recent_cutoff(hours: int = 24) -> dt.datetime:
+    return now() - timedelta(hours=hours)
+
+def aggregate_status_counts(docs: list[Dict[str, Any]], field: str) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for doc in docs:
+        value = doc.get(field)
+        if value:
+            counts[str(value)] = counts.get(str(value), 0) + 1
+    return counts
+
 def ensure_user(user_id: int, name: str):
     users.update_one(
         {"user_id": user_id},
@@ -741,6 +761,8 @@ def start_menu_buttons(user_id: int):
     if not profile.get("onboarding_complete"):
         rows.append([InlineKeyboardButton("Start setup", callback_data="ob:begin")])
     rows.append([InlineKeyboardButton("Today's intention", callback_data="intent:begin")])
+    if get_today_intention(user_id):
+        rows.append([InlineKeyboardButton("Start focus", callback_data="focus:begin")])
     rows.append([InlineKeyboardButton("Goals", callback_data="menu:goals"),
                  InlineKeyboardButton("Settings", callback_data="menu:settings")])
     return InlineKeyboardMarkup(rows)
@@ -748,10 +770,13 @@ def start_menu_buttons(user_id: int):
 def settings_buttons(user_id: int):
     profile = ensure_profile(user_id)
     label = "Resume onboarding" if not profile.get("onboarding_complete") else "Update onboarding"
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton(label, callback_data="ob:begin")],
         [InlineKeyboardButton("Set today's intention", callback_data="intent:begin")],
-    ])
+    ]
+    if get_today_intention(user_id):
+        rows.append([InlineKeyboardButton("Start focus", callback_data="focus:begin")])
+    return InlineKeyboardMarkup(rows)
 
 def timezone_buttons():
     rows = [[InlineKeyboardButton(tz.replace("America/", "").replace("_", " "), callback_data=f"ob:tz:{tz}")] for tz in TIMEZONE_CHOICES]
@@ -891,7 +916,10 @@ async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(user.id, user.full_name or user.username or "human")
     touch_user(user.id, "command:focus")
     if not context.args:
-        return await update.message.reply_text("Usage: /focus <minutes>  (e.g., /focus 25)")
+        goal = ((get_today_intention(user.id) or {}).get("selected_goal")) or ((resolve_current_goal(user.id) or {}).get("goal"))
+        if not goal:
+            return await update.message.reply_text("Set a goal first with /settings or /goals.")
+        return await update.message.reply_text(f"Pick a focus duration for {goal}.", reply_markup=focus_duration_buttons())
     try:
         mins = int(context.args[0])
         if mins <= 0 or mins > 240:
@@ -1124,6 +1152,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current = resolve_current_goal(user.id)
         if not current:
             await query.edit_message_text("Set at least one goal first with /setgoal <goal> <why>.")
+            return
+        goals_for_user = list_user_goals(user.id)
+        if len(goals_for_user) == 1:
+            goal = goals_for_user[0]["goal"]
+            upsert_today_intention(user.id, selected_goal=goal, status="planned")
+            set_profile_conversation(user.id, "intention", "target_text", {"selected_goal": goal})
+            await safe_edit_message_text(query, f"What's today's target for {goal}?")
             return
         set_profile_conversation(user.id, "intention", "goal_pick", {})
         await safe_edit_message_text(query, "Choose the goal for today's intention.", reply_markup=intention_goal_buttons(user.id))
@@ -1660,6 +1695,69 @@ async def cron_weekly(app: Application):
             logger.exception("Weekly summary failed for user_id=%s", uid)
     log_structured("cron_weekly_finish")
 
+def ops_summary_payload(hours: int = 24) -> Dict[str, Any]:
+    cutoff = recent_cutoff(hours)
+    daily_loop_logs = list(logs.find({"kind": "daily_loop", "ts": {"$gte": cutoff}}))
+    intervention_logs = list(logs.find({"kind": "intervention", "ts": {"$gte": cutoff}}))
+    loop_status_logs = list(logs.find({"kind": "loop_status", "ts": {"$gte": cutoff}}))
+    focus_logs = list(logs.find({"kind": "focus_completion", "ts": {"$gte": cutoff}}))
+    session_finishes = list(logs.find({"kind": "session_finish", "ts": {"$gte": cutoff}}))
+    outcomes = list(intervention_outcomes.find({"ts": {"$gte": cutoff}}))
+
+    daily_loop_phase_counts: Dict[str, int] = {}
+    for item in daily_loop_logs:
+        phase = (item.get("data") or {}).get("phase")
+        if phase:
+            daily_loop_phase_counts[phase] = daily_loop_phase_counts.get(phase, 0) + 1
+
+    loop_status_counts: Dict[str, int] = {}
+    for item in loop_status_logs:
+        status = (item.get("data") or {}).get("status")
+        if status:
+            loop_status_counts[status] = loop_status_counts.get(status, 0) + 1
+
+    focus_completion_counts: Dict[str, int] = {}
+    for item in focus_logs:
+        status = (item.get("data") or {}).get("status")
+        if status:
+            focus_completion_counts[status] = focus_completion_counts.get(status, 0) + 1
+
+    onboarding_dropoff = count_docs(
+        profiles,
+        {
+            "onboarding_complete": False,
+            "created_at": {"$lte": now() - timedelta(hours=24)},
+        },
+    )
+
+    return {
+        "window_hours": hours,
+        "timezone_default": TZ,
+        "prompt_delivery": {
+            "daily_loop": daily_loop_phase_counts,
+            "intervention_sends": len(intervention_logs),
+        },
+        "user_responses": {
+            "loop_status": loop_status_counts,
+            "focus_completion": focus_completion_counts,
+        },
+        "intervention_outcomes": {
+            "total": len(outcomes),
+            "responded": sum(1 for item in outcomes if item.get("responded")),
+            "session_started": sum(1 for item in outcomes if item.get("session_started")),
+            "progress_occurred": sum(1 for item in outcomes if item.get("progress_occurred")),
+            "issue_repeated": sum(1 for item in outcomes if item.get("issue_repeated")),
+        },
+        "onboarding": {
+            "incomplete_profiles": count_docs(profiles, {"onboarding_complete": False}),
+            "dropoff_24h": onboarding_dropoff,
+        },
+        "sessions": {
+            "active": count_docs(sessions, {"state": "ACTIVE"}),
+            "finishes": aggregate_status_counts([item.get("data") or {} for item in session_finishes], "to"),
+        },
+    }
+
 # =========================
 # FASTAPI WIRING
 # =========================
@@ -1718,6 +1816,43 @@ async def on_shutdown():
 @app.get("/health")
 async def health():
     return PlainTextResponse("ok")
+
+@app.get("/ops/summary")
+async def ops_summary(request: Request):
+    _check_cron_auth(request)
+    hours = int(request.query_params.get("hours", "24"))
+    hours = max(1, min(hours, 168))
+    return JSONResponse(ops_summary_payload(hours))
+
+@app.get("/ops/verify")
+async def ops_verify(request: Request):
+    _check_cron_auth(request)
+    expected_base = (WEBHOOK_URL or RENDER_EXTERNAL_URL or "").rstrip("/")
+    mongo_ok = False
+    webhook_info: Dict[str, Any] = {}
+    try:
+        mongo.admin.command("ping")
+        mongo_ok = True
+    except Exception:
+        logger.exception("Mongo verification failed")
+    try:
+        info = await tg_app.bot.get_webhook_info()
+        webhook_info = {
+            "url": getattr(info, "url", ""),
+            "pending_update_count": getattr(info, "pending_update_count", None),
+            "last_error_date": getattr(info, "last_error_date", None),
+            "last_error_message": getattr(info, "last_error_message", None),
+        }
+    except Exception:
+        logger.exception("Webhook verification failed")
+    return JSONResponse({
+        "mongo_ok": mongo_ok,
+        "expected_webhook_url": f"{expected_base}/webhook" if expected_base else "",
+        "webhook": webhook_info,
+        "cron_secret_configured": bool(CRON_SECRET),
+        "timezone_default": TZ,
+        "ops_summary_24h": ops_summary_payload(24),
+    })
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):

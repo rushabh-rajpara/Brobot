@@ -89,6 +89,8 @@ Protected by `?secret=$CRON_SECRET`:
 Other useful endpoints:
 
 - `GET /health`
+- `GET /ops/summary?secret=...`
+- `GET /ops/verify?secret=...`
 - `POST /webhook`
 - `POST /sessions/start`
 - `POST /sessions/finish`
@@ -153,14 +155,23 @@ python -m py_compile Telegram_Bot.py
 After deploy:
 
 1. Open `/health` and confirm it returns `ok`.
-2. Confirm Telegram webhook points to `/webhook`.
+2. Open `/ops/verify?secret=...` and confirm:
+   - Mongo is healthy
+   - webhook URL matches `/webhook`
+   - pending updates and last webhook error look sane
 3. Send `/start` and verify onboarding/settings buttons appear.
 4. Create a daily intention and start a focus session from buttons.
 5. Trigger:
    - `/cron/daily`
    - `/cron/weekly`
    - `/cron/sessions-tick`
-6. Check logs for structured events such as:
+6. Open `/ops/summary?secret=...` and review:
+   - prompt delivery
+   - user responses
+   - intervention outcomes
+   - onboarding drop-off
+   - session finish patterns
+7. Check logs for structured events such as:
    - `morning_prompt_sent`
    - `midday_prompt_sent`
    - `eod_prompt_sent`
