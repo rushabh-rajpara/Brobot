@@ -15,6 +15,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.error import BadRequest
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
@@ -773,8 +774,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("intent:status:"):
         status = data.split(":", 2)[2]
-        intention = upsert_today_intention(user.id, status=status)
-        await query.edit_message_text(intention_summary(user.id), reply_markup=intention_done_buttons())
+        intention = get_today_intention(user.id)
+        if not intention:
+            await query.edit_message_text("No daily intention found yet. Start with Today's intention first.")
+            return
+        if intention.get("status") == status:
+            await query.answer(f"Already marked {status}.")
+            return
+        upsert_today_intention(user.id, status=status)
+        try:
+            await query.edit_message_text(intention_summary(user.id), reply_markup=intention_done_buttons())
+        except BadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                await query.answer(f"Status already {status}.")
+                return
+            raise
         return
 
     # Mood selected
