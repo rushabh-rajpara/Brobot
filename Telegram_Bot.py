@@ -63,6 +63,8 @@ profiles = db["profiles"]  # { user_id, timezone, push_style, work_start_hour, b
 daily_intentions = db["daily_intentions"]  # { user_id, date, selected_goal, target, fallback, status, timezone, created_at, updated_at }
 memory = db["memory"]  # { user_id, key, value, confidence, updated_at }
 intervention_outcomes = db["intervention_outcomes"]  # { user_id, ts, trigger_type, mode, blocker, responded, session_started, progress_occurred, issue_repeated, intervention_key }
+control_stats = db["control_stats"]  # { user_id, category, bucket, attempts, successes, weighted_score, last_used_at, last_success_at, updated_at }
+control_events = db["control_events"]  # { user_id, ts, outcome_type, message_type, trigger, phase, hour_bin, time_bucket, intervention_key, pressure_level, silence_reason, related_goal_id, related_session_id, updated_at }
 
 started_confirmed: bool
 nudges_sent: int
@@ -83,6 +85,8 @@ profiles.create_index([("user_id", ASCENDING)], unique=True)
 daily_intentions.create_index([("user_id", ASCENDING), ("date", ASCENDING)], unique=True)
 memory.create_index([("user_id", ASCENDING), ("key", ASCENDING)], unique=True)
 intervention_outcomes.create_index([("user_id", ASCENDING), ("ts", DESCENDING)])
+control_stats.create_index([("user_id", ASCENDING), ("category", ASCENDING), ("bucket", ASCENDING)], unique=True)
+control_events.create_index([("user_id", ASCENDING), ("ts", DESCENDING)])
 
 COMMON_BLOCKERS = ["overwhelmed", "distracted", "tired", "anxious", "perfectionist"]
 PUSH_STYLES = ["gentle", "firm", "ruthless"]
@@ -106,6 +110,13 @@ MODE_STYLE_CANDIDATES = {
     "momentum": ["blunt", "compressed", "tactical"],
     "override": ["compressed", "confrontational", "blunt"],
 }
+CONTROL_TIME_BUCKETS = {
+    "morning": range(6, 10),
+    "late_morning": range(10, 13),
+    "afternoon": range(13, 18),
+    "evening": range(18, 23),
+}
+PRESSURE_LEVELS = ["low", "medium", "high", "sharp"]
 
 # =========================
 # UTIL
@@ -354,6 +365,322 @@ def push_recent_memory(user_id: int, key: str, item: str, *, limit: int = 5, con
     set_memory(user_id, key, items[:limit], confidence)
     return items[:limit]
 
+def hour_time_bucket(hour: int) -> str:
+    for bucket, hours in CONTROL_TIME_BUCKETS.items():
+        if hour in hours:
+            return bucket
+    return "night"
+
+def get_control_stat(user_id: int, category: str, bucket: str) -> Dict[str, Any]:
+    return control_stats.find_one({"user_id": user_id, "category": category, "bucket": bucket}) or {}
+
+def control_stat_rank(stat: Dict[str, Any]) -> float:
+    attempts = int(stat.get("attempts", 0) or 0)
+    successes = int(stat.get("successes", 0) or 0)
+    weighted = float(stat.get("weighted_score", 0.0) or 0.0)
+    if attempts <= 0:
+        return weighted
+    success_rate = successes / max(attempts, 1)
+    confidence = min(attempts / 6.0, 1.0)
+    return weighted + (success_rate * 0.75 * confidence)
+
+def update_control_stat(
+    user_id: int,
+    category: str,
+    bucket: str,
+    *,
+    attempts_delta: int = 0,
+    successes_delta: int = 0,
+    weighted_delta: float = 0.0,
+    mark_used: bool = False,
+    mark_success: bool = False,
+):
+    set_fields: Dict[str, Any] = {"updated_at": now()}
+    if mark_used:
+        set_fields["last_used_at"] = now()
+    if mark_success:
+        set_fields["last_success_at"] = now()
+    inc_fields: Dict[str, Any] = {}
+    if attempts_delta:
+        inc_fields["attempts"] = int(attempts_delta)
+    if successes_delta:
+        inc_fields["successes"] = int(successes_delta)
+    if weighted_delta:
+        inc_fields["weighted_score"] = float(weighted_delta)
+    update_doc: Dict[str, Any] = {
+        "$set": set_fields,
+        "$setOnInsert": {
+            "user_id": user_id,
+            "category": category,
+            "bucket": bucket,
+            "attempts": 0,
+            "successes": 0,
+            "weighted_score": 0.0,
+        },
+    }
+    if inc_fields:
+        update_doc["$inc"] = inc_fields
+    control_stats.update_one(
+        {"user_id": user_id, "category": category, "bucket": bucket},
+        update_doc,
+        upsert=True,
+    )
+
+def get_pending_control(user_id: int) -> Dict[str, Any] | None:
+    return (get_state(user_id) or {}).get("pending_control")
+
+def set_pending_control(user_id: int, payload: Dict[str, Any] | None):
+    state.update_one({"user_id": user_id}, {"$set": {"pending_control": payload}}, upsert=True)
+
+def clear_pending_control(user_id: int):
+    state.update_one({"user_id": user_id}, {"$unset": {"pending_control": ""}}, upsert=True)
+
+def recent_control_events(user_id: int, *, outcome_types: list[str] | None = None, hours: int = 24) -> list[Dict[str, Any]]:
+    query: Dict[str, Any] = {"user_id": user_id, "ts": {"$gte": recent_cutoff(hours)}}
+    if outcome_types:
+        query["outcome_type"] = {"$in": outcome_types}
+    return list(control_events.find(query).sort("ts", DESCENDING))
+
+def parse_control_intervention_key(intervention_key: str | None) -> Dict[str, str]:
+    parts = str(intervention_key or "").split(":")
+    if len(parts) >= 5:
+        return {
+            "mode": parts[0],
+            "blocker": parts[1],
+            "pressure_level": parts[2],
+            "action_offer": parts[3],
+            "phrasing_style": parts[4],
+        }
+    return {}
+
+def choose_pressure_level(user_id: int, context: Dict[str, Any] | None = None) -> str:
+    context = context or {}
+    blocker = context.get("blocker") or detect_blocker(user_id, context.get("explicit_blocker"))
+    avoidance = recent_avoidance_count(user_id)
+    blocked = recent_blocked_sessions(user_id)
+    success = recent_success_count(user_id)
+    missed = int((users.find_one({"user_id": user_id}) or {}).get("missed_days", 0))
+    pressure = "medium"
+    if blocker in {"tired", "anxious"}:
+        pressure = "low" if missed < 3 else "medium"
+    elif blocked >= 2:
+        pressure = "medium"
+    elif avoidance >= 4:
+        pressure = "sharp"
+    elif avoidance >= 2 or missed >= 2:
+        pressure = "high"
+    elif success >= 3:
+        pressure = "low"
+    push_recent_memory(user_id, "recent_pressure_levels", pressure, limit=6, confidence=0.7)
+    return pressure
+
+def _pressure_rank_boost(user_id: int, pressure: str) -> float:
+    stat = get_control_stat(user_id, "pressure_level", pressure)
+    return control_stat_rank(stat)
+
+def candidate_intervention_actions(user_id: int, mode: str, trigger: str, blocker_name: str, goal: str, restart: int, decay: Dict[str, Any]) -> list[Dict[str, Any]]:
+    candidates: list[Dict[str, Any]] = []
+    if mode == "clarity":
+        if decay.get("action") == "replace":
+            candidates.append({"action_offer": "replace_goal", "action": f"{goal} is dragging too much friction. Replace it or switch goals for today.", "priority": 1.0})
+        if decay.get("action") == "split":
+            candidates.append({"action_offer": "split_goal", "action": f"{goal} is too heavy as one lump. Split it into a smaller visible chunk.", "priority": 0.95})
+        candidates.append({"action_offer": "shrink_target", "action": f"Shrink {goal} until it feels almost too easy to start.", "priority": 0.9})
+        candidates.append({"action_offer": "next_visible_win", "action": f"Pick the next visible win for {goal}. Name one outcome you can finish today and ignore the rest.", "priority": 0.8})
+    elif mode == "momentum":
+        candidates.append({"action_offer": "restart_block", "action": missed_day_action(user_id, goal, restart) if trigger == "missed_day" else f"Reset cleanly today. Choose a smaller target for {goal} and protect {restart} minutes for it.", "priority": 1.0})
+        candidates.append({"action_offer": "shrink_target", "action": f"Cut {goal} down to one visible move and protect {restart} minutes for it.", "priority": 0.85})
+    elif mode == "override":
+        candidates.append({"action_offer": "override_reset", "action": f"Stop spiraling. Breathe, stand up, and do the smallest safe action toward {goal} right now.", "priority": 1.0})
+        candidates.append({"action_offer": "start_5", "action": f"Do exactly 5 minutes on {goal}. Then reassess.", "priority": 0.75})
+    elif mode == "recovery":
+        candidates.append({"action_offer": "rescue_plan", "action": f"Reset the board. Pick one useful move on {goal}, ignore side quests, and restart for {min(restart, 10)} minutes.", "priority": 1.0})
+        candidates.append({"action_offer": "start_5", "action": blocker_action("tired" if blocker_name in {"tired", "anxious"} else blocker_name, 5, goal), "priority": 0.9})
+        candidates.append({"action_offer": "smallest_step", "action": blocker_action(blocker_name, restart, goal), "priority": 0.85})
+    elif mode == "focus":
+        candidates.append({"action_offer": "start_focus", "action": f"Protect {restart} minutes on {goal} right now. Start before you negotiate with yourself.", "priority": 1.0})
+        candidates.append({"action_offer": "smallest_step", "action": blocker_action(blocker_name, restart, goal), "priority": 0.9})
+        candidates.append({"action_offer": "shrink_target", "action": f"Shrink {goal} to one visible move, then start a short focus block.", "priority": 0.8})
+    else:
+        candidates.append({"action_offer": "smallest_step", "action": blocker_action(blocker_name, restart, goal), "priority": 1.0})
+        candidates.append({"action_offer": "start_5", "action": f"Start {goal} for 5 minutes. Momentum first, quality later.", "priority": 0.9})
+        candidates.append({"action_offer": "restart_block", "action": f"Choose one useful target for {goal} and protect {restart} minutes for it.", "priority": 0.8})
+    return candidates
+
+def choose_ranked_candidate(user_id: int, mode: str, blocker_name: str, pressure_level: str, candidates: list[Dict[str, Any]]) -> Dict[str, Any]:
+    best = None
+    best_score = -9999.0
+    for candidate in candidates:
+        bucket = f"{mode}:{blocker_name}:{pressure_level}:{candidate['action_offer']}"
+        stat_score = control_stat_rank(get_control_stat(user_id, "intervention", bucket))
+        score = float(candidate.get("priority", 0.0)) + stat_score + (_pressure_rank_boost(user_id, pressure_level) * 0.1)
+        if score > best_score:
+            best = candidate
+            best_score = score
+    return best or candidates[0]
+
+def choose_ranked_phrasing_style(user_id: int, mode: str, tone_policy: str, pressure_level: str) -> str:
+    candidates = list(MODE_STYLE_CANDIDATES.get(mode, ["tactical", "compressed"]))
+    if tone_policy == "confrontational":
+        candidates = ["confrontational", "blunt"] + [c for c in candidates if c not in {"confrontational", "blunt"}]
+    elif tone_policy == "calm":
+        candidates = ["calm", "tactical"] + [c for c in candidates if c not in {"calm", "tactical"}]
+    elif tone_policy == "compressed":
+        candidates = ["compressed", "blunt"] + [c for c in candidates if c not in {"compressed", "blunt"}]
+    recent_styles = recent_list_memory(user_id, "recent_phrasing_styles", limit=3)
+    best_style = candidates[0]
+    best_score = -9999.0
+    for idx, style in enumerate(candidates):
+        bucket = f"{mode}:{pressure_level}:{style}"
+        stat_score = control_stat_rank(get_control_stat(user_id, "phrasing_style", bucket))
+        repetition_penalty = 0.35 if style in recent_styles[:2] else 0.0
+        score = (1.0 - (idx * 0.08)) + stat_score - repetition_penalty
+        if score > best_score:
+            best_style = style
+            best_score = score
+    return best_style
+
+def choose_best_time_window(user_id: int, context: Dict[str, Any]) -> int:
+    phase = str(context.get("phase") or "general")
+    default_hour = int(context.get("default_hour", 9))
+    if phase == "morning":
+        offsets = [0, 1, -1, 2]
+    elif phase == "midday":
+        offsets = [0, -1, 1, 2]
+    else:
+        offsets = [0, -1, 1, 2]
+    candidates: list[int] = []
+    for offset in offsets:
+        hour = max(6, min(23, default_hour + offset))
+        if hour not in candidates:
+            candidates.append(hour)
+    total_attempts = 0
+    best_hour = default_hour
+    best_score = -9999.0
+    activity = get_memory(user_id, "time_of_day_activity", {}) or {}
+    slumps = get_memory(user_id, "time_of_day_slumps", {}) or {}
+    for hour in candidates:
+        stat = get_control_stat(user_id, "timing_hour", f"{phase}:{hour}")
+        total_attempts += int(stat.get("attempts", 0) or 0)
+        stat_score = control_stat_rank(stat)
+        activity_score = float(activity.get(str(hour), 0)) * 0.04
+        slump_penalty = float(slumps.get(str(hour), 0)) * 0.08
+        proximity_bonus = 0.1 if hour == default_hour else 0.0
+        score = stat_score + activity_score - slump_penalty + proximity_bonus
+        if score > best_score:
+            best_hour = hour
+            best_score = score
+    return best_hour if total_attempts >= 3 else default_hour
+
+def should_send_message(user_id: int, message_type: str, context: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    context = context or {}
+    state_doc = get_state(user_id)
+    recent_sent = recent_control_events(user_id, outcome_types=["proactive_sent"], hours=6)
+    recent_positive = recent_control_events(user_id, outcome_types=["user_response", "button_tap", "session_started", "session_completed", "progress_marked"], hours=6)
+    pending = state_doc.get("pending_control") or {}
+    pending_sent_at = ensure_aware(pending.get("sent_at"))
+    if get_active_session(user_id) and message_type not in {"session_nudge", "session_completion"}:
+        return {"decision": "defer", "reason": "active_session"}
+    if cooldown_active(user_id) and message_type in {"intervention", "morning_followup"}:
+        return {"decision": "defer", "reason": "cooldown"}
+    if pending_sent_at and not pending.get("resolved") and now() < pending_sent_at + timedelta(minutes=90) and message_type in {"morning_followup", "intervention", "midday_prompt", "eod_prompt"}:
+        return {"decision": "defer", "reason": "recent_unanswered_prompt"}
+    if len(recent_sent) >= 3 and not recent_positive and message_type not in {"session_completion"}:
+        return {"decision": "skip", "reason": "low_yield_burst"}
+    if context.get("pressure_level") == "low" and detect_blocker(user_id) in {"tired", "anxious"} and len(recent_sent) >= 2:
+        return {"decision": "defer", "reason": "overload_backoff"}
+    return {"decision": "send", "reason": "allowed"}
+
+def record_outcome(user_id: int, event: Dict[str, Any]) -> Dict[str, Any]:
+    ts = event.get("ts") or now()
+    local_ts = ensure_aware(ts).astimezone(ZoneInfo(get_user_timezone(user_id)))
+    pending = get_pending_control(user_id) or {}
+    doc = {
+        "user_id": user_id,
+        "ts": ts,
+        "updated_at": now(),
+        "outcome_type": event.get("outcome_type"),
+        "message_type": event.get("message_type") or pending.get("message_type"),
+        "trigger": event.get("trigger") or pending.get("trigger"),
+        "phase": event.get("phase") or pending.get("phase"),
+        "hour_bin": event.get("hour_bin", pending.get("hour_bin", local_ts.hour)),
+        "time_bucket": event.get("time_bucket") or pending.get("time_bucket") or hour_time_bucket(local_ts.hour),
+        "intervention_key": event.get("intervention_key") or pending.get("intervention_key"),
+        "pressure_level": event.get("pressure_level") or pending.get("pressure_level"),
+        "silence_reason": event.get("silence_reason"),
+        "related_goal_id": event.get("related_goal_id") or event.get("goal") or effective_intention_goal(user_id),
+        "related_session_id": event.get("related_session_id"),
+        "responded": bool(event.get("responded", False)),
+        "progress_occurred": bool(event.get("progress_occurred", False)),
+        "session_started": bool(event.get("session_started", False)),
+        "session_completed": bool(event.get("session_completed", False)),
+        "issue_repeated": bool(event.get("issue_repeated", False)),
+    }
+    control_events.insert_one(doc)
+    update_control_scores(user_id, doc)
+    return doc
+
+def update_control_scores(user_id: int, event: Dict[str, Any]):
+    outcome = str(event.get("outcome_type") or "")
+    phase = event.get("phase")
+    hour_bin = event.get("hour_bin")
+    time_bucket = event.get("time_bucket")
+    intervention_key = event.get("intervention_key")
+    pressure_level = event.get("pressure_level")
+    silence_reason = event.get("silence_reason")
+    score_map = {
+        "proactive_sent": 0.0,
+        "user_response": 1.0,
+        "button_tap": 1.1,
+        "same_day_return": 0.8,
+        "next_day_return": 1.2,
+        "session_started": 1.8,
+        "session_completed": 2.4,
+        "progress_marked": 1.7,
+        "no_response": -0.8,
+        "repeated_avoidance": -1.0,
+        "missed_day": -1.25,
+        "message_deferred": -0.1,
+        "message_skipped": -0.15,
+    }
+    attempts_delta = 1 if outcome == "proactive_sent" else 0
+    successes_delta = 1 if outcome in {"user_response", "button_tap", "same_day_return", "next_day_return", "session_started", "session_completed", "progress_marked"} else 0
+    weighted_delta = score_map.get(outcome, 0.0)
+    if phase and hour_bin is not None:
+        update_control_stat(user_id, "timing_hour", f"{phase}:{hour_bin}", attempts_delta=attempts_delta, successes_delta=successes_delta, weighted_delta=weighted_delta, mark_used=True, mark_success=successes_delta > 0)
+    if phase and time_bucket:
+        update_control_stat(user_id, "timing_bucket", f"{phase}:{time_bucket}", attempts_delta=attempts_delta, successes_delta=successes_delta, weighted_delta=weighted_delta, mark_used=True, mark_success=successes_delta > 0)
+    if intervention_key:
+        update_control_stat(user_id, "intervention", intervention_key, attempts_delta=attempts_delta, successes_delta=successes_delta, weighted_delta=weighted_delta, mark_used=True, mark_success=successes_delta > 0)
+        parsed = parse_control_intervention_key(intervention_key)
+        if parsed:
+            update_control_stat(
+                user_id,
+                "intervention",
+                f"{parsed['mode']}:{parsed['blocker']}:{parsed['pressure_level']}:{parsed['action_offer']}",
+                attempts_delta=attempts_delta,
+                successes_delta=successes_delta,
+                weighted_delta=weighted_delta,
+                mark_used=True,
+                mark_success=successes_delta > 0,
+            )
+            update_control_stat(
+                user_id,
+                "phrasing_style",
+                f"{parsed['mode']}:{parsed['pressure_level']}:{parsed['phrasing_style']}",
+                attempts_delta=attempts_delta,
+                successes_delta=successes_delta,
+                weighted_delta=weighted_delta,
+                mark_used=True,
+                mark_success=successes_delta > 0,
+            )
+    if pressure_level:
+        update_control_stat(user_id, "pressure_level", pressure_level, attempts_delta=0 if outcome != "proactive_sent" else 1, successes_delta=successes_delta, weighted_delta=weighted_delta, mark_used=True, mark_success=successes_delta > 0)
+    if pressure_level and event.get("message_type"):
+        update_control_stat(user_id, "pressure_by_message", f"{event.get('message_type')}:{pressure_level}", attempts_delta=attempts_delta, successes_delta=successes_delta, weighted_delta=weighted_delta, mark_used=True, mark_success=successes_delta > 0)
+    if silence_reason:
+        update_control_stat(user_id, "silence_reason", silence_reason, attempts_delta=1, successes_delta=0, weighted_delta=weighted_delta, mark_used=True)
+
 def record_intervention_outcome(
     user_id: int,
     *,
@@ -364,6 +691,12 @@ def record_intervention_outcome(
     session_started: bool = False,
     progress_occurred: bool = False,
     issue_repeated: bool = False,
+    session_completed: bool = False,
+    returned_same_day: bool = False,
+    returned_next_day: bool = False,
+    pressure_level: str | None = None,
+    phrasing_style: str | None = None,
+    action_offer: str | None = None,
 ):
     doc = {
         "user_id": user_id,
@@ -375,7 +708,13 @@ def record_intervention_outcome(
         "session_started": bool(session_started),
         "progress_occurred": bool(progress_occurred),
         "issue_repeated": bool(issue_repeated),
-        "intervention_key": f"{trigger_type}:{mode}:{blocker or 'none'}",
+        "session_completed": bool(session_completed),
+        "returned_same_day": bool(returned_same_day),
+        "returned_next_day": bool(returned_next_day),
+        "pressure_level": pressure_level,
+        "phrasing_style": phrasing_style,
+        "action_offer": action_offer,
+        "intervention_key": f"{trigger_type}:{mode}:{blocker or 'none'}:{pressure_level or 'medium'}:{action_offer or 'default'}:{phrasing_style or 'default'}",
     }
     intervention_outcomes.insert_one(doc)
     if blocker:
@@ -388,6 +727,48 @@ def record_intervention_outcome(
 
 def touch_user(user_id: int, source: str):
     ts = now()
+    pending = get_pending_control(user_id) or {}
+    pending_sent_at = ensure_aware(pending.get("sent_at"))
+    if pending and pending_sent_at and ts >= pending_sent_at and not pending.get("resolved"):
+        record_outcome(
+            user_id,
+            {
+                "outcome_type": "user_response",
+                "message_type": pending.get("message_type"),
+                "trigger": pending.get("trigger"),
+                "phase": pending.get("phase"),
+                "intervention_key": pending.get("intervention_key"),
+                "pressure_level": pending.get("pressure_level"),
+                "responded": True,
+            },
+        )
+        if pending.get("local_date") == local_now_for_user(user_id).date().isoformat():
+            record_outcome(
+                user_id,
+                {
+                    "outcome_type": "same_day_return",
+                    "message_type": pending.get("message_type"),
+                    "trigger": pending.get("trigger"),
+                    "phase": pending.get("phase"),
+                    "intervention_key": pending.get("intervention_key"),
+                    "pressure_level": pending.get("pressure_level"),
+                },
+            )
+        else:
+            record_outcome(
+                user_id,
+                {
+                    "outcome_type": "next_day_return",
+                    "message_type": pending.get("message_type"),
+                    "trigger": pending.get("trigger"),
+                    "phase": pending.get("phase"),
+                    "intervention_key": pending.get("intervention_key"),
+                    "pressure_level": pending.get("pressure_level"),
+                },
+            )
+        pending["resolved"] = True
+        pending["responded_at"] = ts
+        set_pending_control(user_id, pending)
     state.update_one({"user_id": user_id}, {"$set": {"last_user_touch_at": ts}}, upsert=True)
     set_profile_fields(user_id, last_user_touch_at=ts, last_user_touch_source=source)
     local_hour = local_now_for_user(user_id).hour
@@ -498,6 +879,22 @@ def start_session(user_id: int, timebox_min: int, goal: str | None = None, *, nu
     res = sessions.insert_one(doc)
     sid = res.inserted_id
     log_event(user_id, "session_start", {"goal": g, "timebox_min": timebox_min, "sid": str(sid), "nudges_enabled": bool(nudges_enabled), "source": source})
+    record_outcome(
+        user_id,
+        {
+            "outcome_type": "session_started",
+            "message_type": "focus_session",
+            "related_session_id": str(sid),
+            "goal": g,
+            "session_started": True,
+            "progress_occurred": False,
+        },
+    )
+    pending = get_pending_control(user_id) or {}
+    if pending:
+        pending["resolved"] = True
+        pending["related_session_id"] = str(sid)
+        set_pending_control(user_id, pending)
     return sid
 
 def finish_latest_session(user_id: int, state: str = "DONE") -> bool:
@@ -507,6 +904,22 @@ def finish_latest_session(user_id: int, state: str = "DONE") -> bool:
         return False
     sessions.update_one({"_id": s["_id"]}, {"$set": {"state": state, "ends_at": now()}})
     log_event(user_id, "session_finish", {"sid": str(s["_id"]), "to": state})
+    if state == "DONE":
+        record_outcome(
+            user_id,
+            {
+                "outcome_type": "session_completed",
+                "message_type": "focus_session",
+                "related_session_id": str(s["_id"]),
+                "goal": s.get("goal"),
+                "session_completed": True,
+                "progress_occurred": True,
+            },
+        )
+    pending = get_pending_control(user_id) or {}
+    if pending:
+        pending["resolved"] = True
+        set_pending_control(user_id, pending)
     return True
 
 def get_tone(user_doc: Dict[str, Any]) -> str:
@@ -537,15 +950,18 @@ def phrase_intervention(user_id: int, intervention: Dict[str, Any]) -> str:
     goal = intervention.get("goal") or effective_intention_goal(user_id) or "your target"
     tone_policy = intervention.get("tone_policy", "firm")
     phrasing_style = intervention.get("phrasing_style", "tactical")
+    pressure_level = intervention.get("pressure_level", "medium")
     recent_phrases = ", ".join(recent_list_memory(user_id, "recent_phrase_signatures", limit=3)) or "none"
     prompt = (
         f"You are phrasing a deterministic Telegram accountability intervention.\n"
         f"Tone policy: {tone_policy}.\n"
         f"Phrasing style: {phrasing_style}.\n"
+        f"Pressure level: {pressure_level}.\n"
         f"Goal: {goal}.\n"
         f"Trigger: {intervention.get('trigger')}.\n"
         f"Mode: {intervention.get('mode')}.\n"
         f"Blocker: {intervention.get('blocker') or 'none'}.\n"
+        f"Action offer: {intervention.get('action_offer') or 'default'}.\n"
         f"Action: {intervention.get('action')}.\n"
         f"Recent phrase signatures to avoid repeating: {recent_phrases}.\n"
         "Write 1-2 short Telegram-ready sentences. Keep it sharp, useful, and non-generic. Do not invent logic or extra options."
@@ -750,15 +1166,22 @@ def detect_goal_decay(user_id: int, goal: str | None = None) -> Dict[str, Any]:
         return {"decayed": True, "goal": selected_goal, "severity": "shrink", "action": "shrink"}
     return {"decayed": False, "goal": selected_goal, "severity": "none", "action": None}
 
-def choose_tone_policy(user_id: int, trigger: str, *, blocker: str | None = None) -> str:
+def choose_tone_policy(user_id: int, trigger: str, *, blocker: str | None = None, pressure_level: str | None = None) -> str:
     recent_success = recent_success_count(user_id)
     avoidance = recent_avoidance_count(user_id)
     blocked = recent_blocked_sessions(user_id)
     severity = missed_day_severity(user_id)
     low_energy = top_bucket(get_memory(user_id, "time_of_day_slumps", {})) is not None and detect_blocker(user_id, blocker) == "tired"
     profile_style = ensure_profile(user_id).get("push_style", "firm")
+    pressure = pressure_level or "medium"
     if trigger == "override":
         return "calm"
+    if pressure == "low":
+        return "calm"
+    if pressure == "sharp":
+        return "confrontational" if profile_style == "ruthless" else "blunt"
+    if pressure == "high":
+        return "blunt" if profile_style != "gentle" else "tactical"
     if severity == "critical":
         return "compressed"
     if avoidance >= 3 or blocked >= 2:
@@ -770,18 +1193,7 @@ def choose_tone_policy(user_id: int, trigger: str, *, blocker: str | None = None
     return {"gentle": "calm", "firm": "tactical", "ruthless": "blunt"}.get(profile_style, "tactical")
 
 def choose_phrasing_style(user_id: int, mode: str, tone_policy: str) -> str:
-    candidates = list(MODE_STYLE_CANDIDATES.get(mode, ["tactical", "compressed"]))
-    if tone_policy == "confrontational":
-        candidates = ["confrontational", "blunt"] + [c for c in candidates if c not in {"confrontational", "blunt"}]
-    elif tone_policy == "calm":
-        candidates = ["calm", "tactical"] + [c for c in candidates if c not in {"calm", "tactical"}]
-    elif tone_policy == "compressed":
-        candidates = ["compressed", "blunt"] + [c for c in candidates if c not in {"compressed", "blunt"}]
-    recent_styles = recent_list_memory(user_id, "recent_phrasing_styles", limit=3)
-    for style in candidates:
-        if style not in recent_styles[:2]:
-            return style
-    return candidates[0]
+    return choose_ranked_phrasing_style(user_id, mode, tone_policy, "medium")
 
 def blocker_action(blocker: str, restart_size_min: int, goal: str) -> str:
     if blocker == "overwhelmed":
@@ -858,36 +1270,29 @@ def choose_intervention(user_id: int, trigger: str, *, blocker: str | None = Non
     elif trigger == "goal_decay":
         mode = "clarity"
 
-    if mode == "clarity":
-        if decay.get("decayed"):
-            if decay.get("action") == "replace":
-                action = f"{goal} is dragging too much friction. Replace it or switch goals for today."
-            elif decay.get("action") == "split":
-                action = f"{goal} is too heavy as one lump. Split it into a smaller visible chunk."
-            else:
-                action = f"Shrink {goal} until it feels almost too easy to start."
-        else:
-            action = f"Pick the next visible win for {goal}. Name one outcome you can finish today and ignore the rest."
-    elif mode == "momentum":
-        action = missed_day_action(user_id, goal, restart) if trigger == "missed_day" else f"Reset cleanly today. Choose a smaller target for {goal} and protect {restart} minutes for it."
-    elif mode == "override":
-        action = f"Stop spiraling. Breathe, stand up, and do the smallest safe action toward {goal} right now."
-    else:
-        action = blocker_action(blocker_name, restart, goal)
+    pressure_level = choose_pressure_level(user_id, {"trigger": trigger, "blocker": blocker_name, "mode": mode})
+    candidates = candidate_intervention_actions(user_id, mode, trigger, blocker_name, goal, restart, decay)
+    chosen = choose_ranked_candidate(user_id, mode, blocker_name, pressure_level, candidates)
+    action = chosen["action"]
+    action_offer = chosen["action_offer"]
 
-    tone_policy = choose_tone_policy(user_id, trigger, blocker=blocker_name)
-    phrasing_style = choose_phrasing_style(user_id, mode, tone_policy)
+    tone_policy = choose_tone_policy(user_id, trigger, blocker=blocker_name, pressure_level=pressure_level)
+    phrasing_style = choose_ranked_phrasing_style(user_id, mode, tone_policy, pressure_level)
+    intervention_key = f"{mode}:{blocker_name}:{pressure_level}:{action_offer}:{phrasing_style}"
 
     result = {
         "trigger": trigger,
         "mode": mode,
         "blocker": blocker_name,
         "action": action,
+        "action_offer": action_offer,
         "goal": goal,
         "restart_size_min": restart,
         "session_id": str(session_doc["_id"]) if session_doc else None,
         "tone_policy": tone_policy,
         "phrasing_style": phrasing_style,
+        "pressure_level": pressure_level,
+        "intervention_key": intervention_key,
         "goal_decay": decay,
     }
     return result
@@ -1015,10 +1420,11 @@ def daily_loop_hours_for_user(user_id: int) -> Dict[str, int]:
         work_start = int(profile.get("work_start_hour", 9))
         anchor_hour = max(6, work_start - 1)
     anchor_hour = int(anchor_hour)
-    midday = min(23, anchor_hour + 5)
-    end_of_day = min(23, anchor_hour + 11)
+    morning = choose_best_time_window(user_id, {"phase": "morning", "default_hour": anchor_hour})
+    midday = choose_best_time_window(user_id, {"phase": "midday", "default_hour": min(23, anchor_hour + 5)})
+    end_of_day = choose_best_time_window(user_id, {"phase": "eod", "default_hour": min(23, anchor_hour + 11)})
     return {
-        "morning": anchor_hour,
+        "morning": morning,
         "midday": midday,
         "eod": end_of_day,
     }
@@ -1344,6 +1750,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     ensure_user(user.id, user.full_name or user.username or "human")
     touch_user(user.id, f"callback:{data.split(':', 1)[0]}")
+    record_outcome(user.id, {"outcome_type": "button_tap", "message_type": "callback", "trigger": data})
 
     if data == "noop":
         await query.answer()
@@ -1492,6 +1899,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         selected_goal = intention.get("selected_goal")
         if status == "done" and selected_goal:
             mark_goal_status(user.id, selected_goal, "done")
+            record_outcome(user.id, {"outcome_type": "progress_marked", "message_type": "daily_intention", "phase": "eod", "goal": selected_goal, "progress_occurred": True})
         elif status == "active" and selected_goal:
             mark_goal_status(user.id, selected_goal, "active")
         intention = upsert_today_intention(user.id, status=status)
@@ -1624,11 +2032,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             upsert_today_intention(user.id, status="done")
             log_event(user.id, "focus_completion", {"status": "done"})
             record_intervention_outcome(user.id, trigger_type="focus_completion", mode="focus", responded=True, session_started=True, progress_occurred=True, issue_repeated=False)
+            record_outcome(user.id, {"outcome_type": "progress_marked", "message_type": "focus_completion", "phase": "focus", "progress_occurred": True})
             await query.edit_message_text("Session logged as done. Keep the momentum.")
         elif outcome == "partial":
             upsert_today_intention(user.id, status="partial")
             log_event(user.id, "focus_completion", {"status": "partial"})
             record_intervention_outcome(user.id, trigger_type="focus_completion", mode="momentum", responded=True, session_started=True, progress_occurred=True, issue_repeated=False)
+            record_outcome(user.id, {"outcome_type": "progress_marked", "message_type": "focus_completion", "phase": "focus", "progress_occurred": True})
             await query.edit_message_text("Partial counts. Keep the useful pieces and reset clean.")
         else:
             upsert_today_intention(user.id, status="blocked")
@@ -1699,6 +2109,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "loop:midday:avoiding":
         upsert_today_intention(user.id, midday_status="avoiding", midday_response_at=now())
         log_event(user.id, "loop_status", {"phase": "midday", "status": "avoiding"})
+        record_outcome(user.id, {"outcome_type": "repeated_avoidance", "message_type": "midday_prompt", "phase": "midday", "issue_repeated": True})
         increment_memory_counter(user.id, "time_of_day_slumps", str(local_now_for_user(user.id).hour), 1, 0.7)
         record_intervention_outcome(user.id, trigger_type="midday_check", mode="recovery", responded=True, session_started=False, progress_occurred=False, issue_repeated=True)
         await query.edit_message_text(
@@ -1731,6 +2142,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Logged done. Bank the win and protect tomorrow.")
         elif status == "missed":
             bump_missed(user.id, 1)
+            record_outcome(user.id, {"outcome_type": "missed_day", "message_type": "eod_prompt", "phase": "eod", "issue_repeated": True})
             increment_memory_counter(user.id, "time_of_day_slumps", str(local_now_for_user(user.id).hour), 1, 0.75)
             record_intervention_outcome(user.id, trigger_type="eod_check", mode="recovery", responded=True, session_started=False, progress_occurred=False, issue_repeated=True)
             await safe_edit_message_text(
@@ -1942,10 +2354,93 @@ async def run_override(user_id: int, goal: str, context: ContextTypes.DEFAULT_TY
 def loop_hours_for_user(user_id: int) -> Dict[str, int]:
     return daily_loop_hours_for_user(user_id)
 
+async def send_proactive_message(
+    app: Application,
+    user_id: int,
+    *,
+    text: str,
+    message_type: str,
+    phase: str | None = None,
+    trigger: str | None = None,
+    reply_markup=None,
+    parse_mode=None,
+    intervention: Dict[str, Any] | None = None,
+    related_session_id: str | None = None,
+):
+    decision = should_send_message(
+        user_id,
+        message_type,
+        {
+            "phase": phase,
+            "trigger": trigger,
+            "pressure_level": (intervention or {}).get("pressure_level"),
+        },
+    )
+    if decision["decision"] != "send":
+        record_outcome(
+            user_id,
+            {
+                "outcome_type": f"message_{decision['decision']}",
+                "message_type": message_type,
+                "phase": phase,
+                "trigger": trigger,
+                "intervention_key": (intervention or {}).get("intervention_key"),
+                "pressure_level": (intervention or {}).get("pressure_level"),
+                "silence_reason": decision["reason"],
+                "related_session_id": related_session_id,
+            },
+        )
+        log_structured("message_suppressed", user_id=user_id, message_type=message_type, phase=phase, trigger=trigger, decision=decision["decision"], reason=decision["reason"])
+        return False
+    await app.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+    local_date = local_now_for_user(user_id).date().isoformat()
+    local_hour = local_now_for_user(user_id).hour
+    pending = {
+        "message_type": message_type,
+        "phase": phase,
+        "trigger": trigger,
+        "intervention_key": (intervention or {}).get("intervention_key"),
+        "pressure_level": (intervention or {}).get("pressure_level"),
+        "action_offer": (intervention or {}).get("action_offer"),
+        "phrasing_style": (intervention or {}).get("phrasing_style"),
+        "sent_at": now(),
+        "local_date": local_date,
+        "hour_bin": local_hour,
+        "time_bucket": hour_time_bucket(local_hour),
+        "resolved": False,
+        "related_session_id": related_session_id,
+    }
+    set_pending_control(user_id, pending)
+    record_outcome(
+        user_id,
+        {
+            "outcome_type": "proactive_sent",
+            "message_type": message_type,
+            "phase": phase,
+            "trigger": trigger,
+            "intervention_key": (intervention or {}).get("intervention_key"),
+            "pressure_level": (intervention or {}).get("pressure_level"),
+            "related_session_id": related_session_id,
+        },
+    )
+    return True
+
 async def send_intervention_message(app: Application, user_id: int, trigger: str, *, blocker: str | None = None, session_doc: Dict[str, Any] | None = None, reply_markup=None):
     intervention = choose_intervention(user_id, trigger, blocker=blocker, session_doc=session_doc)
     text = phrase_intervention(user_id, intervention)
-    await app.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup or premium_action_buttons(user_id, intervention))
+    sent = await send_proactive_message(
+        app,
+        user_id,
+        text=text,
+        message_type="intervention",
+        phase="intervention",
+        trigger=trigger,
+        reply_markup=reply_markup or premium_action_buttons(user_id, intervention),
+        intervention=intervention,
+        related_session_id=str(session_doc["_id"]) if session_doc else None,
+    )
+    if not sent:
+        return False
     log_structured("intervention_send", user_id=user_id, trigger=trigger, mode=intervention.get("mode"), blocker=intervention.get("blocker"), session_id=str(session_doc["_id"]) if session_doc else None)
     log_event(user_id, "intervention", {"trigger": trigger, "mode": intervention.get("mode"), "blocker": blocker, "session_id": str(session_doc["_id"]) if session_doc else None})
     record_intervention_outcome(
@@ -1957,7 +2452,11 @@ async def send_intervention_message(app: Application, user_id: int, trigger: str
         session_started=False,
         progress_occurred=False,
         issue_repeated=trigger in {"repeated_avoidance", "missed_day"},
+        pressure_level=intervention.get("pressure_level"),
+        phrasing_style=intervention.get("phrasing_style"),
+        action_offer=intervention.get("action_offer"),
     )
+    return True
 
 async def run_daily_loop_service(app: Application):
     now_utc = dt.datetime.now(dt.timezone.utc)
@@ -1975,63 +2474,95 @@ async def run_daily_loop_service(app: Application):
             last_touch = ensure_aware(state_doc.get("last_user_touch_at"))
 
             if yesterday.get("status") == "missed" and hour >= hours["morning"] and not intention.get("missed_day_recovery_sent_at"):
-                upsert_today_intention(uid, missed_day_recovery_sent_at=now(), morning_prompt_sent_at=intention.get("morning_prompt_sent_at") or now())
-                await send_intervention_message(app, uid, "missed_day", reply_markup=intervention_reply_markup(uid, "missed_day"))
+                sent = await send_intervention_message(app, uid, "missed_day", reply_markup=intervention_reply_markup(uid, "missed_day"))
+                if sent:
+                    upsert_today_intention(uid, missed_day_recovery_sent_at=now(), morning_prompt_sent_at=intention.get("morning_prompt_sent_at") or now())
                 continue
 
             if hour >= hours["morning"] and not intention.get("morning_prompt_sent_at"):
-                upsert_today_intention(uid, morning_prompt_sent_at=now(), status=intention.get("status") or "planned")
-                await app.bot.send_message(uid, text=morning_summary_text(uid), reply_markup=morning_anchor_buttons())
-                log_structured("morning_prompt_sent", user_id=uid, hour=hour, date=today_key_for_user(uid))
-                log_event(uid, "daily_loop", {"phase": "morning_anchor"})
+                sent = await send_proactive_message(
+                    app,
+                    uid,
+                    text=morning_summary_text(uid),
+                    message_type="morning_prompt",
+                    phase="morning",
+                    reply_markup=morning_anchor_buttons(),
+                )
+                if sent:
+                    upsert_today_intention(uid, morning_prompt_sent_at=now(), status=intention.get("status") or "planned")
+                    log_structured("morning_prompt_sent", user_id=uid, hour=hour, date=today_key_for_user(uid))
+                    log_event(uid, "daily_loop", {"phase": "morning_anchor"})
                 continue
 
             morning_sent_at = ensure_aware(intention.get("morning_prompt_sent_at"))
             if morning_sent_at and not intention.get("morning_response_at") and now() >= morning_sent_at + timedelta(hours=2):
                 if not last_touch or last_touch <= morning_sent_at:
                     if not intention.get("morning_followup_sent_at"):
-                        upsert_today_intention(uid, morning_followup_sent_at=now())
-                        await send_intervention_message(app, uid, "no_response_after_morning_prompt", reply_markup=morning_anchor_buttons())
+                        record_outcome(uid, {"outcome_type": "no_response", "message_type": "morning_prompt", "phase": "morning"})
+                        sent = await send_intervention_message(app, uid, "no_response_after_morning_prompt", reply_markup=morning_anchor_buttons())
+                        if sent:
+                            upsert_today_intention(uid, morning_followup_sent_at=now())
                         continue
 
             if hour >= hours["midday"] and intention.get("target") and not intention.get("midday_prompt_sent_at"):
-                upsert_today_intention(uid, midday_prompt_sent_at=now())
-                await app.bot.send_message(uid, text="Midday check. Where are you at?", reply_markup=midday_check_buttons())
-                log_structured("midday_prompt_sent", user_id=uid, hour=hour, goal=intention.get("selected_goal"))
-                log_event(uid, "daily_loop", {"phase": "midday"})
+                sent = await send_proactive_message(
+                    app,
+                    uid,
+                    text="Midday check. Where are you at?",
+                    message_type="midday_prompt",
+                    phase="midday",
+                    reply_markup=midday_check_buttons(),
+                )
+                if sent:
+                    upsert_today_intention(uid, midday_prompt_sent_at=now())
+                    log_structured("midday_prompt_sent", user_id=uid, hour=hour, goal=intention.get("selected_goal"))
+                    log_event(uid, "daily_loop", {"phase": "midday"})
                 continue
 
             target_updated_at = ensure_aware(intention.get("updated_at"))
             if intention.get("target") and intention.get("status") in {"planned", "active", "partial", "blocked"} and not get_active_session(uid):
                 if target_updated_at and now() >= target_updated_at + timedelta(minutes=90):
                     if not intention.get("target_inactivity_sent_at") and (not last_touch or last_touch <= target_updated_at):
-                        upsert_today_intention(uid, target_inactivity_sent_at=now())
-                        await send_intervention_message(app, uid, "inactivity_after_target", reply_markup=focus_duration_buttons())
+                        record_outcome(uid, {"outcome_type": "no_response", "message_type": "midday_prompt", "phase": "midday"})
+                        sent = await send_intervention_message(app, uid, "inactivity_after_target", reply_markup=focus_duration_buttons())
+                        if sent:
+                            upsert_today_intention(uid, target_inactivity_sent_at=now())
                         continue
 
             if hour >= hours["eod"] and intention.get("target") and not intention.get("eod_prompt_sent_at"):
-                upsert_today_intention(uid, eod_prompt_sent_at=now())
-                await app.bot.send_message(uid, text="End of day check. How did it go?", reply_markup=end_of_day_buttons())
-                log_structured("eod_prompt_sent", user_id=uid, hour=hour, goal=intention.get("selected_goal"))
-                log_event(uid, "daily_loop", {"phase": "eod"})
+                sent = await send_proactive_message(
+                    app,
+                    uid,
+                    text="End of day check. How did it go?",
+                    message_type="eod_prompt",
+                    phase="eod",
+                    reply_markup=end_of_day_buttons(),
+                )
+                if sent:
+                    upsert_today_intention(uid, eod_prompt_sent_at=now())
+                    log_structured("eod_prompt_sent", user_id=uid, hour=hour, goal=intention.get("selected_goal"))
+                    log_event(uid, "daily_loop", {"phase": "eod"})
                 continue
 
             if recent_avoidance_count(uid) >= 2 and not intention.get("avoidance_recovery_sent_at"):
-                upsert_today_intention(uid, avoidance_recovery_sent_at=now())
-                await send_intervention_message(app, uid, "repeated_avoidance", reply_markup=intervention_reply_markup(uid, "repeated_avoidance"))
+                record_outcome(uid, {"outcome_type": "repeated_avoidance", "message_type": "intervention", "phase": "intervention", "issue_repeated": True})
+                sent = await send_intervention_message(app, uid, "repeated_avoidance", reply_markup=intervention_reply_markup(uid, "repeated_avoidance"))
+                if sent:
+                    upsert_today_intention(uid, avoidance_recovery_sent_at=now())
                 continue
 
             goal_updated_at = ensure_aware((current_goal or {}).get("updated_at"))
             if current_goal and goal_updated_at and now() >= goal_updated_at + timedelta(days=7):
                 if not intention and not state_doc.get("stale_goal_sent_at"):
-                    state.update_one({"user_id": uid}, {"$set": {"stale_goal_sent_at": now()}}, upsert=True)
                     maybe_log_goal_decay(uid, current_goal.get("goal"))
-                    await send_intervention_message(
+                    sent = await send_intervention_message(
                         app,
                         uid,
                         "goal_decay" if detect_goal_decay(uid, current_goal.get("goal")).get("decayed") else "stale_goal",
                         reply_markup=intervention_reply_markup(uid, "goal_decay" if detect_goal_decay(uid, current_goal.get("goal")).get("decayed") else "stale_goal"),
                     )
+                    if sent:
+                        state.update_one({"user_id": uid}, {"$set": {"stale_goal_sent_at": now()}}, upsert=True)
         except Exception:
             logger.exception("Daily loop service failed for user_id=%s", uid)
 
@@ -2071,6 +2602,7 @@ def ops_summary_payload(hours: int = 24) -> Dict[str, Any]:
     focus_logs = list(logs.find({"kind": "focus_completion", "ts": {"$gte": cutoff}}))
     session_finishes = list(logs.find({"kind": "session_finish", "ts": {"$gte": cutoff}}))
     outcomes = list(intervention_outcomes.find({"ts": {"$gte": cutoff}}))
+    control = list(control_events.find({"ts": {"$gte": cutoff}}))
 
     daily_loop_phase_counts: Dict[str, int] = {}
     for item in daily_loop_logs:
@@ -2089,6 +2621,12 @@ def ops_summary_payload(hours: int = 24) -> Dict[str, Any]:
         status = (item.get("data") or {}).get("status")
         if status:
             focus_completion_counts[status] = focus_completion_counts.get(status, 0) + 1
+
+    control_counts: Dict[str, int] = {}
+    for item in control:
+        outcome_type = item.get("outcome_type")
+        if outcome_type:
+            control_counts[outcome_type] = control_counts.get(outcome_type, 0) + 1
 
     onboarding_dropoff = count_docs(
         profiles,
@@ -2115,6 +2653,10 @@ def ops_summary_payload(hours: int = 24) -> Dict[str, Any]:
             "session_started": sum(1 for item in outcomes if item.get("session_started")),
             "progress_occurred": sum(1 for item in outcomes if item.get("progress_occurred")),
             "issue_repeated": sum(1 for item in outcomes if item.get("issue_repeated")),
+        },
+        "control": {
+            "events": control_counts,
+            "stats": count_docs(control_stats, {}),
         },
         "onboarding": {
             "incomplete_profiles": count_docs(profiles, {"onboarding_complete": False}),
@@ -2319,14 +2861,19 @@ async def cron_sessions_tick(app: Application):
         ends_at = ensure_aware(s.get("ends_at")) or now_utc
         if now_utc >= ends_at and not s.get("asked_completion", False):
             try:
-                await app.bot.send_message(
+                sent = await send_proactive_message(
+                    app,
                     uid,
                     text=f"Time's up for {_session_msg_goal_line(s)}. How did it go?",
+                    message_type="session_completion",
+                    phase="focus",
                     reply_markup=focus_completion_buttons(),
                     parse_mode="Markdown",
+                    related_session_id=str(s["_id"]),
                 )
-                log_structured("session_completion_prompt_sent", user_id=uid, session_id=str(s["_id"]), goal=s.get("goal"))
-                sessions.update_one({"_id": s["_id"]}, {"$set": {"asked_completion": True}})
+                if sent:
+                    log_structured("session_completion_prompt_sent", user_id=uid, session_id=str(s["_id"]), goal=s.get("goal"))
+                    sessions.update_one({"_id": s["_id"]}, {"$set": {"asked_completion": True}})
             except Exception:
                 logger.exception("Session completion prompt failed for user_id=%s", uid)
             continue
@@ -2358,9 +2905,21 @@ async def cron_sessions_tick(app: Application):
             continue
 
         try:
-            await app.bot.send_message(uid, text=txt, reply_markup=kb, parse_mode="Markdown")
-            log_structured("session_nudge_sent", user_id=uid, session_id=str(s["_id"]), started=started, nudges_sent=nudges + 1)
-            sessions.update_one({"_id": s["_id"]}, {"$set": {"next_check_at": next_dt}, "$inc": {"nudges_sent": 1}})
+            sent = await send_proactive_message(
+                app,
+                uid,
+                text=txt,
+                message_type="session_nudge",
+                phase="focus",
+                reply_markup=kb,
+                parse_mode="Markdown",
+                related_session_id=str(s["_id"]),
+            )
+            if sent:
+                log_structured("session_nudge_sent", user_id=uid, session_id=str(s["_id"]), started=started, nudges_sent=nudges + 1)
+                sessions.update_one({"_id": s["_id"]}, {"$set": {"next_check_at": next_dt}, "$inc": {"nudges_sent": 1}})
+            else:
+                sessions.update_one({"_id": s["_id"]}, {"$set": {"next_check_at": next_dt}})
         except Exception:
             logger.exception("Session tick failed for user_id=%s", uid)
     log_structured("cron_sessions_tick_finish", active_sessions=len(active))
