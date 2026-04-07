@@ -1,0 +1,14 @@
+name: Brobot Weekly
+
+on:
+  schedule:
+    - cron: "0 13 * * MON"
+  workflow_dispatch:
+
+jobs:
+  weekly:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call weekly summary
+        run: |
+          curl -fsS "https://brobot-l2g7.onrender.com/cron/weekly?secret=${{ secrets.BROBOT_CRON_SECRET }}"

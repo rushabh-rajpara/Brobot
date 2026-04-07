@@ -1,0 +1,24 @@
+name: Brobot Cron
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  sessions_tick:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '*/5 * * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call sessions tick
+        run: |
+          curl -fsS "https://brobot-l2g7.onrender.com/cron/sessions-tick?secret=${{ secrets.BROBOT_CRON_SECRET }}"
+
+  daily:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '*/15 * * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call daily loop
+        run: |
+          curl -fsS "https://brobot-l2g7.onrender.com/cron/daily?secret=${{ secrets.BROBOT_CRON_SECRET }}"
