@@ -1,0 +1,17 @@
+name: Brobot Sessions Tick
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  sessions_tick:
+    runs-on: ubuntu-latest
+    env:
+      BROBOT_CRON_SECRET: ${{ secrets.BROBOT_CRON_SECRET }}
+    steps:
+      - name: Call sessions tick
+        run: |
+          SECRET="$(printf '%s' "$BROBOT_CRON_SECRET" | tr -d '\r\n')"
+          curl -fsS --get --data-urlencode "secret=$SECRET" "https://brobot-l2g7.onrender.com/cron/sessions-tick"
