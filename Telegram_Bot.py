@@ -1974,12 +1974,12 @@ async def run_daily_loop_service(app: Application):
             current_goal = resolve_current_goal(uid)
             last_touch = ensure_aware(state_doc.get("last_user_touch_at"))
 
-            if yesterday.get("status") == "missed" and hour == hours["morning"] and not intention.get("missed_day_recovery_sent_at"):
+            if yesterday.get("status") == "missed" and hour >= hours["morning"] and not intention.get("missed_day_recovery_sent_at"):
                 upsert_today_intention(uid, missed_day_recovery_sent_at=now(), morning_prompt_sent_at=intention.get("morning_prompt_sent_at") or now())
                 await send_intervention_message(app, uid, "missed_day", reply_markup=intervention_reply_markup(uid, "missed_day"))
                 continue
 
-            if hour == hours["morning"] and not intention.get("morning_prompt_sent_at"):
+            if hour >= hours["morning"] and not intention.get("morning_prompt_sent_at"):
                 upsert_today_intention(uid, morning_prompt_sent_at=now(), status=intention.get("status") or "planned")
                 await app.bot.send_message(uid, text=morning_summary_text(uid), reply_markup=morning_anchor_buttons())
                 log_structured("morning_prompt_sent", user_id=uid, hour=hour, date=today_key_for_user(uid))
@@ -1994,7 +1994,7 @@ async def run_daily_loop_service(app: Application):
                         await send_intervention_message(app, uid, "no_response_after_morning_prompt", reply_markup=morning_anchor_buttons())
                         continue
 
-            if hour == hours["midday"] and intention.get("target") and not intention.get("midday_prompt_sent_at"):
+            if hour >= hours["midday"] and intention.get("target") and not intention.get("midday_prompt_sent_at"):
                 upsert_today_intention(uid, midday_prompt_sent_at=now())
                 await app.bot.send_message(uid, text="Midday check. Where are you at?", reply_markup=midday_check_buttons())
                 log_structured("midday_prompt_sent", user_id=uid, hour=hour, goal=intention.get("selected_goal"))
@@ -2009,7 +2009,7 @@ async def run_daily_loop_service(app: Application):
                         await send_intervention_message(app, uid, "inactivity_after_target", reply_markup=focus_duration_buttons())
                         continue
 
-            if hour == hours["eod"] and intention.get("target") and not intention.get("eod_prompt_sent_at"):
+            if hour >= hours["eod"] and intention.get("target") and not intention.get("eod_prompt_sent_at"):
                 upsert_today_intention(uid, eod_prompt_sent_at=now())
                 await app.bot.send_message(uid, text="End of day check. How did it go?", reply_markup=end_of_day_buttons())
                 log_structured("eod_prompt_sent", user_id=uid, hour=hour, goal=intention.get("selected_goal"))
