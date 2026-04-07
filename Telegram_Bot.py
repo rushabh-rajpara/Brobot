@@ -514,24 +514,120 @@ def recent_low_yield_action_patterns(user_id: int, *, hours: int = 36) -> Dict[s
         counts[mode_bucket] = counts.get(mode_bucket, 0) + 1
     return counts
 
-def choose_pressure_level(user_id: int, context: Dict[str, Any] | None = None) -> str:
+def _stat_effective_attempts(stat: Dict[str, Any]) -> float:
+    decay = _stat_recency_multiplier(stat)
+    return float(stat.get("attempts", 0) or 0.0) * decay
+
+def stat_confidence(stat: Dict[str, Any], *, target_attempts: float = 6.0, target_weighted: float = 3.0) -> float:
+    decay = _stat_recency_multiplier(stat)
+    attempts = float(stat.get("attempts", 0) or 0.0) * decay
+    weighted = abs(float(stat.get("weighted_score", 0.0) or 0.0) * decay)
+    if attempts < 1.0:
+        return 0.0
+    if attempts < 2.0:
+        return min(attempts / 4.0, 0.35)
+    attempt_conf = min(attempts / max(target_attempts, 0.1), 1.0)
+    weighted_conf = min(weighted / max(target_weighted, 0.1), 1.0)
+    return min((attempt_conf * 0.8) + (weighted_conf * 0.2), 1.0)
+
+def intervention_confidence(stat: Dict[str, Any]) -> float:
+    return stat_confidence(stat, target_attempts=5.0, target_weighted=3.0)
+
+def _pressure_base_decision(user_id: int, context: Dict[str, Any] | None = None) -> tuple[str, list[str]]:
     context = context or {}
     blocker = context.get("blocker") or detect_blocker(user_id, context.get("explicit_blocker"))
     avoidance = recent_avoidance_count(user_id)
     blocked = recent_blocked_sessions(user_id)
     success = recent_success_count(user_id)
     missed = int((users.find_one({"user_id": user_id}) or {}).get("missed_days", 0))
-    pressure = "medium"
     if blocker in {"tired", "anxious"}:
-        pressure = "low" if missed < 3 else "medium"
-    elif blocked >= 2:
-        pressure = "medium"
-    elif avoidance >= 4:
-        pressure = "sharp"
-    elif avoidance >= 2 or missed >= 2:
-        pressure = "high"
-    elif success >= 3:
-        pressure = "low"
+        return ("low" if missed < 3 else "medium"), ["low", "medium"]
+    if blocked >= 2:
+        return "medium", ["low", "medium"]
+    if avoidance >= 4:
+        return "sharp", ["medium", "high", "sharp"]
+    if avoidance >= 2 or missed >= 2:
+        return "high", ["medium", "high"]
+    if success >= 3:
+        return "low", ["low", "medium"]
+    return "medium", ["low", "medium", "high"]
+
+def _pressure_candidate_score(user_id: int, pressure: str, context: Dict[str, Any] | None = None) -> tuple[float, float, float]:
+    context = context or {}
+    message_type = context.get("message_type")
+    phase = context.get("phase")
+    trigger = context.get("trigger")
+    stats: list[Dict[str, Any]] = [get_control_stat(user_id, "pressure_level", pressure)]
+    if message_type:
+        stats.append(get_control_stat(user_id, "pressure_by_message", f"{message_type}:{pressure}"))
+    if phase:
+        stats.append(get_control_stat(user_id, "pressure_phase", f"{phase}:{pressure}"))
+    if trigger:
+        stats.append(get_control_stat(user_id, "pressure_trigger", f"{trigger}:{pressure}"))
+    scores = [control_stat_rank(stat) for stat in stats]
+    confidences = [stat_confidence(stat, target_attempts=4.0, target_weighted=2.0) for stat in stats]
+    evidence = max((_stat_effective_attempts(stat) for stat in stats), default=0.0)
+    learned_score = (scores[0] * 0.45) + (scores[1] * 0.30 if len(scores) > 1 else 0.0) + (scores[2] * 0.15 if len(scores) > 2 else 0.0) + (scores[3] * 0.10 if len(scores) > 3 else 0.0)
+    learned_confidence = max(confidences) if confidences else 0.0
+    return learned_score, learned_confidence, evidence
+
+def precision_reentry_state(user_id: int, context: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    context = context or {}
+    recent_negative = recent_control_events(user_id, outcome_types=["message_skip", "message_skipped", "message_defer", "message_deferred"], hours=24)
+    recent_positive = recent_control_events(user_id, outcome_types=["same_day_return", "next_day_return", "session_started", "session_completed", "progress_marked"], hours=18)
+    skip_count = sum(1 for item in recent_negative if str(item.get("outcome_type")).startswith("message_skip"))
+    defer_count = sum(1 for item in recent_negative if str(item.get("outcome_type")).startswith("message_defer"))
+    latest_negative_ts = ensure_aware(recent_negative[0].get("ts")) if recent_negative else None
+    latest_positive_ts = ensure_aware(recent_positive[0].get("ts")) if recent_positive else None
+    recovered_after_silence = bool(latest_negative_ts and latest_positive_ts and latest_positive_ts >= latest_negative_ts)
+    active = (
+        not recovered_after_silence
+        and (
+            (skip_count >= 2)
+            or (defer_count >= 3)
+            or ((skip_count + defer_count) >= 2 and not recent_positive)
+        )
+    )
+    return {
+        "active": active,
+        "skip_count": skip_count,
+        "defer_count": defer_count,
+        "negative_count": len(recent_negative),
+        "recovered_after_silence": recovered_after_silence,
+    }
+
+def choose_pressure_level(user_id: int, context: Dict[str, Any] | None = None) -> str:
+    context = context or {}
+    candidate_pressures = list(context.get("candidate_pressures") or [])
+    base_pressure, allowed_pressures = _pressure_base_decision(user_id, context)
+    if not candidate_pressures:
+        candidate_pressures = list(allowed_pressures)
+    else:
+        candidate_pressures = [pressure for pressure in candidate_pressures if pressure in allowed_pressures]
+        if not candidate_pressures:
+            candidate_pressures = list(allowed_pressures)
+    ranked: list[tuple[float, str]] = []
+    best_confidence = 0.0
+    candidate_evidence: Dict[str, float] = {}
+    pressure_order = {name: idx for idx, name in enumerate(PRESSURE_LEVELS)}
+    for pressure in candidate_pressures:
+        learned_score, learned_confidence, evidence = _pressure_candidate_score(user_id, pressure, context)
+        best_confidence = max(best_confidence, learned_confidence)
+        candidate_evidence[pressure] = evidence
+        distance_penalty = abs(pressure_order[pressure] - pressure_order[base_pressure]) * 0.18
+        base_bias = 0.35 if pressure == base_pressure else 0.0
+        score = base_bias + (learned_score * learned_confidence) - distance_penalty
+        if context.get("precision_reentry"):
+            score += learned_confidence * 0.1
+        ranked.append((score, pressure))
+    pressure = base_pressure
+    if ranked and best_confidence >= 0.6:
+        ranked_map = {name: score for score, name in ranked}
+        winner = max(ranked, key=lambda item: item[0])[1]
+        base_score = ranked_map.get(base_pressure, -9999.0)
+        winner_score = ranked_map.get(winner, -9999.0)
+        if candidate_evidence.get(winner, 0.0) >= 3.0 and winner_score >= base_score + 0.08:
+            pressure = winner
     push_recent_memory(user_id, "recent_pressure_levels", pressure, limit=6, confidence=0.7)
     return pressure
 
@@ -573,11 +669,19 @@ def choose_ranked_candidate(user_id: int, mode: str, blocker_name: str, pressure
     best_score = -9999.0
     recent_actions = recent_list_memory(user_id, "recent_action_offers", limit=4)
     low_yield_patterns = recent_low_yield_action_patterns(user_id)
+    precision_state = precision_reentry_state(user_id, {"mode": mode, "pressure_level": pressure_level})
     for candidate in candidates:
         bucket = f"{mode}:{blocker_name}:{pressure_level}:{candidate['action_offer']}"
-        stat_score = control_stat_rank(get_control_stat(user_id, "intervention", bucket))
+        detail_stat = get_control_stat(user_id, "intervention", bucket)
+        stat_score = control_stat_rank(detail_stat)
         parent_bucket = _parent_action_bucket(mode, blocker_name, candidate["action_offer"])
-        parent_score = control_stat_rank(get_control_stat(user_id, "intervention_parent", parent_bucket))
+        parent_stat = get_control_stat(user_id, "intervention_parent", parent_bucket)
+        parent_score = control_stat_rank(parent_stat)
+        detail_conf = intervention_confidence(detail_stat)
+        parent_conf = intervention_confidence(parent_stat)
+        detail_influence = 0.15 + (detail_conf * 0.75)
+        parent_influence = 0.1 + (parent_conf * 0.55)
+        exploitation_boost = max(detail_conf, parent_conf) * (0.18 if precision_state.get("active") else 0.08)
         repetition_penalty = 0.0
         if recent_actions:
             if candidate["action_offer"] == recent_actions[0]:
@@ -588,21 +692,32 @@ def choose_ranked_candidate(user_id: int, mode: str, blocker_name: str, pressure
                 repetition_penalty = 0.12
         low_yield_penalty = min(low_yield_patterns.get(parent_bucket, 0) * 0.35, 1.05)
         low_yield_penalty += min(low_yield_patterns.get(f"mode:{mode}", 0) * 0.08, 0.24)
+        precision_bonus = 0.0
+        precision_block_penalty = 0.0
+        if precision_state.get("active") and low_yield_patterns.get(parent_bucket, 0) >= 2:
+            precision_block_penalty = min(0.45 + ((low_yield_patterns.get(parent_bucket, 0) - 2) * 0.2), 0.85)
+        if precision_state.get("active") and candidate["action_offer"] in {"start_5", "smallest_step", "rescue_plan"} and precision_block_penalty == 0.0:
+            precision_bonus = 0.18
         score = (
             float(candidate.get("priority", 0.0))
-            + (stat_score * 0.65)
-            + (parent_score * 0.35)
+            + (stat_score * detail_influence)
+            + (parent_score * parent_influence)
             + (_pressure_rank_boost(user_id, pressure_level) * 0.1)
+            + exploitation_boost
+            + precision_bonus
             - repetition_penalty
             - low_yield_penalty
+            - precision_block_penalty
         )
         if score > best_score:
             best = candidate
             best_score = score
     return best or candidates[0]
 
-def choose_ranked_phrasing_style(user_id: int, mode: str, tone_policy: str, pressure_level: str) -> str:
+def choose_ranked_phrasing_style(user_id: int, mode: str, tone_policy: str, pressure_level: str, *, precision_reentry: bool = False) -> str:
     candidates = list(MODE_STYLE_CANDIDATES.get(mode, ["tactical", "compressed"]))
+    if precision_reentry:
+        candidates = ["compressed", "blunt", "tactical"] + [c for c in candidates if c not in {"compressed", "blunt", "tactical"}]
     if tone_policy == "confrontational":
         candidates = ["confrontational", "blunt"] + [c for c in candidates if c not in {"confrontational", "blunt"}]
     elif tone_policy == "calm":
@@ -616,7 +731,8 @@ def choose_ranked_phrasing_style(user_id: int, mode: str, tone_policy: str, pres
         bucket = f"{mode}:{pressure_level}:{style}"
         stat_score = control_stat_rank(get_control_stat(user_id, "phrasing_style", bucket))
         repetition_penalty = 0.35 if style in recent_styles[:2] else 0.0
-        score = (1.0 - (idx * 0.08)) + stat_score - repetition_penalty
+        precision_bonus = 0.2 if precision_reentry and style == "compressed" else 0.0
+        score = (1.0 - (idx * 0.08)) + stat_score + precision_bonus - repetition_penalty
         if score > best_score:
             best_style = style
             best_score = score
@@ -645,10 +761,12 @@ def choose_best_time_window(user_id: int, context: Dict[str, Any]) -> int:
         stat = get_control_stat(user_id, "timing_hour", f"{phase}:{hour}")
         total_attempts += float(stat.get("attempts", 0) or 0.0) * _stat_recency_multiplier(stat)
         stat_score = control_stat_rank(stat)
+        stat_conf = stat_confidence(stat, target_attempts=4.0, target_weighted=2.0)
         activity_score = float(activity.get(str(hour), 0)) * 0.04
         slump_penalty = float(slumps.get(str(hour), 0)) * 0.08
-        proximity_bonus = 0.1 if hour == default_hour else 0.0
-        score = stat_score + activity_score - slump_penalty + proximity_bonus
+        proximity_bonus = (0.02 if context.get("precision_reentry") else 0.1) if hour == default_hour else 0.0
+        precision_bonus = (stat_score * stat_conf * 0.25) if context.get("precision_reentry") else 0.0
+        score = stat_score + activity_score - slump_penalty + proximity_bonus + precision_bonus
         if score > best_score:
             best_hour = hour
             best_score = score
@@ -692,6 +810,7 @@ def record_outcome(user_id: int, event: Dict[str, Any]) -> Dict[str, Any]:
         "action_offer": event.get("action_offer") or pending.get("action_offer"),
         "phrasing_style": event.get("phrasing_style") or pending.get("phrasing_style"),
         "parent_action_key": event.get("parent_action_key") or pending.get("parent_action_key"),
+        "precision_reentry": bool(event.get("precision_reentry", pending.get("precision_reentry", False))),
         "silence_reason": event.get("silence_reason"),
         "related_goal_id": event.get("related_goal_id") or event.get("goal") or effective_intention_goal(user_id),
         "related_session_id": event.get("related_session_id"),
@@ -775,6 +894,10 @@ def update_control_scores(user_id: int, event: Dict[str, Any]):
         update_control_stat(user_id, "pressure_level", pressure_level, attempts_delta=0 if outcome != "proactive_sent" else 1, successes_delta=successes_delta, weighted_delta=weighted_delta, mark_used=True, mark_success=successes_delta > 0)
     if pressure_level and event.get("message_type"):
         update_control_stat(user_id, "pressure_by_message", f"{event.get('message_type')}:{pressure_level}", attempts_delta=attempts_delta, successes_delta=successes_delta, weighted_delta=weighted_delta, mark_used=True, mark_success=successes_delta > 0)
+    if pressure_level and phase:
+        update_control_stat(user_id, "pressure_phase", f"{phase}:{pressure_level}", attempts_delta=attempts_delta, successes_delta=successes_delta, weighted_delta=weighted_delta, mark_used=True, mark_success=successes_delta > 0)
+    if pressure_level and event.get("trigger"):
+        update_control_stat(user_id, "pressure_trigger", f"{event.get('trigger')}:{pressure_level}", attempts_delta=attempts_delta, successes_delta=successes_delta, weighted_delta=weighted_delta, mark_used=True, mark_success=successes_delta > 0)
     if silence_reason:
         update_control_stat(user_id, "silence_reason", silence_reason, attempts_delta=1, successes_delta=0, weighted_delta=weighted_delta, mark_used=True)
 
@@ -1370,14 +1493,27 @@ def choose_intervention(user_id: int, trigger: str, *, blocker: str | None = Non
     if trigger == "repeated_avoidance" and decay.get("action") in {"split", "replace"} and recent_avoidance_count(user_id) >= 2:
         mode = "clarity"
 
-    pressure_level = choose_pressure_level(user_id, {"trigger": trigger, "blocker": blocker_name, "mode": mode})
+    precision_state = precision_reentry_state(user_id, {"trigger": trigger, "mode": mode, "blocker": blocker_name})
+    pressure_level = choose_pressure_level(
+        user_id,
+        {
+            "trigger": trigger,
+            "blocker": blocker_name,
+            "mode": mode,
+            "phase": "intervention",
+            "message_type": "intervention",
+            "precision_reentry": precision_state.get("active"),
+        },
+    )
     candidates = candidate_intervention_actions(user_id, mode, trigger, blocker_name, goal, restart, decay)
     chosen = choose_ranked_candidate(user_id, mode, blocker_name, pressure_level, candidates)
     action = chosen["action"]
     action_offer = chosen["action_offer"]
 
     tone_policy = choose_tone_policy(user_id, trigger, blocker=blocker_name, pressure_level=pressure_level)
-    phrasing_style = choose_ranked_phrasing_style(user_id, mode, tone_policy, pressure_level)
+    if precision_state.get("active") and pressure_level != "low":
+        tone_policy = "compressed"
+    phrasing_style = choose_ranked_phrasing_style(user_id, mode, tone_policy, pressure_level, precision_reentry=precision_state.get("active", False))
     intervention_key = f"{mode}:{blocker_name}:{pressure_level}:{action_offer}:{phrasing_style}"
 
     result = {
@@ -1394,6 +1530,7 @@ def choose_intervention(user_id: int, trigger: str, *, blocker: str | None = Non
         "pressure_level": pressure_level,
         "intervention_key": intervention_key,
         "goal_decay": decay,
+        "precision_reentry": bool(precision_state.get("active")),
     }
     return result
 
@@ -1513,6 +1650,7 @@ def set_active_goal(user_id: int, goal: str) -> bool:
 def daily_loop_hours_for_user(user_id: int) -> Dict[str, int]:
     profile = ensure_profile(user_id)
     user_doc = users.find_one({"user_id": user_id}) or {}
+    precision = precision_reentry_state(user_id)
     anchor_hour = profile.get("loop_anchor_hour")
     if anchor_hour is None:
         anchor_hour = user_doc.get("checkin_hour")
@@ -1520,9 +1658,9 @@ def daily_loop_hours_for_user(user_id: int) -> Dict[str, int]:
         work_start = int(profile.get("work_start_hour", 9))
         anchor_hour = max(6, work_start - 1)
     anchor_hour = int(anchor_hour)
-    morning = choose_best_time_window(user_id, {"phase": "morning", "default_hour": anchor_hour})
-    midday = choose_best_time_window(user_id, {"phase": "midday", "default_hour": min(23, anchor_hour + 5)})
-    end_of_day = choose_best_time_window(user_id, {"phase": "eod", "default_hour": min(23, anchor_hour + 11)})
+    morning = choose_best_time_window(user_id, {"phase": "morning", "default_hour": anchor_hour, "precision_reentry": precision.get("active")})
+    midday = choose_best_time_window(user_id, {"phase": "midday", "default_hour": min(23, anchor_hour + 5), "precision_reentry": precision.get("active")})
+    end_of_day = choose_best_time_window(user_id, {"phase": "eod", "default_hour": min(23, anchor_hour + 11), "precision_reentry": precision.get("active")})
     return {
         "morning": morning,
         "midday": midday,
@@ -2500,6 +2638,7 @@ async def send_proactive_message(
                     intervention.get("blocker", "none"),
                     intervention.get("action_offer", "default"),
                 ) if intervention and intervention.get("action_offer") else None,
+                "precision_reentry": bool((intervention or {}).get("precision_reentry")),
                 "silence_reason": decision["reason"],
                 "related_session_id": related_session_id,
             },
@@ -2532,6 +2671,7 @@ async def send_proactive_message(
             intervention.get("blocker", "none"),
             intervention.get("action_offer", "default"),
         ) if intervention and intervention.get("action_offer") else None,
+        "precision_reentry": bool((intervention or {}).get("precision_reentry")),
         "sent_at": now(),
         "local_date": local_date,
         "hour_bin": local_hour,
@@ -2558,6 +2698,7 @@ async def send_proactive_message(
                 intervention.get("blocker", "none"),
                 intervention.get("action_offer", "default"),
             ) if intervention and intervention.get("action_offer") else None,
+            "precision_reentry": bool((intervention or {}).get("precision_reentry")),
             "related_session_id": related_session_id,
         },
     )
@@ -3356,22 +3497,25 @@ async def ops_verify(request: Request):
         logger.exception("Mongo verification failed")
     try:
         info = await tg_app.bot.get_webhook_info()
+        last_error_date = getattr(info, "last_error_date", None)
+        if isinstance(last_error_date, dt.datetime):
+            last_error_date = (ensure_aware(last_error_date) or last_error_date).isoformat()
         webhook_info = {
             "url": getattr(info, "url", ""),
             "pending_update_count": getattr(info, "pending_update_count", None),
-            "last_error_date": getattr(info, "last_error_date", None),
+            "last_error_date": last_error_date,
             "last_error_message": getattr(info, "last_error_message", None),
         }
     except Exception:
         logger.exception("Webhook verification failed")
-    return JSONResponse({
+    return JSONResponse(mongo_safe({
         "mongo_ok": mongo_ok,
         "expected_webhook_url": f"{expected_base}/webhook" if expected_base else "",
         "webhook": webhook_info,
         "cron_secret_configured": bool(CRON_SECRET),
         "timezone_default": TZ,
         "ops_summary_24h": ops_summary_payload(24),
-    })
+    }))
 
 @app.get("/dev/clock")
 async def dev_clock_get(request: Request):
