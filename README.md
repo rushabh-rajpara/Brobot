@@ -140,12 +140,37 @@ python -m py_compile Telegram_Bot.py
 
 - The web service runs the FastAPI app from `Telegram_Bot.py`.
 - `WEBHOOK_URL` should match the public Render hostname.
-- Render cron jobs should call:
-  - `/cron/daily`
-  - `/cron/weekly`
-  - `/cron/sessions-tick`
 - The current `render.yaml` is aligned to:
   - `https://brobot-l2g7.onrender.com`
+
+### Live Scheduling
+
+Brobot's proactive behavior does not self-schedule inside the app process.
+Morning / midday / end-of-day prompts, follow-ups, and focus nudges only happen when cron endpoints are called.
+
+Current recommended live setup:
+
+- Deploy the web service on Render
+- Use GitHub Actions to call:
+  - `/cron/daily`
+  - `/cron/sessions-tick`
+  - `/cron/weekly`
+
+Current workflow files:
+
+- `.github/workflows/brobot-daily.yml`
+  - every 15 minutes
+- `.github/workflows/brobot-sessions-tick.yml`
+  - every 5 minutes
+- `.github/workflows/brobot-weekly.yml`
+  - every Monday
+
+Required GitHub Actions secret:
+
+- `BROBOT_CRON_SECRET`
+  - value must match `CRON_SECRET`
+
+Render cron jobs can also be used if you prefer, but GitHub Actions is the current documented live path.
 
 ## Operational Checks
 
@@ -158,7 +183,15 @@ After deploy:
    - pending updates and last webhook error look sane
 3. Send `/start` and verify onboarding/settings buttons appear.
 4. Create a daily intention and start a focus session from buttons.
-5. Trigger:
+5. Verify GitHub Actions workflows are present and green:
+   - `Brobot Daily`
+   - `Brobot Sessions Tick`
+   - `Brobot Weekly`
+6. Trigger manually at least once:
+   - `Brobot Daily`
+   - `Brobot Sessions Tick`
+   - `Brobot Weekly`
+7. Or hit directly:
    - `/cron/daily`
    - `/cron/weekly`
    - `/cron/sessions-tick`
@@ -175,6 +208,45 @@ After deploy:
    - `session_nudge_sent`
    - `intervention_send`
    - `weekly_summary_sent`
+
+## Automated Tests
+
+Brobot now includes a repo test suite that exercises the real scenario matrix plus key control-layer behavior.
+
+Test file:
+
+- `tests/test_brobot_features.py`
+
+What it covers:
+
+- all built-in real-life scenarios from `dev_scenarios.py`
+- morning / midday / end-of-day loop behavior
+- missed-day and avoidance recovery
+- stale-goal / goal-decay behavior
+- focus nudges and completion prompts
+- onboarding dropoff and manual-timezone cases
+- adaptive timing
+- low-yield silence behavior
+- learned pressure staying bounded
+- precision re-entry recovery
+
+Run the full suite:
+
+```bash
+py -3 -m unittest tests.test_brobot_features -v
+```
+
+Run only scenario coverage:
+
+```bash
+py -3 -m unittest tests.test_brobot_features.BrobotScenarioTests -v
+```
+
+Run only control logic checks:
+
+```bash
+py -3 -m unittest tests.test_brobot_features.BrobotControlLogicTests -v
+```
 
 ## Fast Test Harness
 
@@ -265,6 +337,17 @@ To see the proof messages in your Telegram chat instead of suppressing them:
 
 ```bash
 py -3 dev_scenarios.py --base-url http://127.0.0.1:10000 --secret YOUR_CRON_SECRET --user-id YOUR_TELEGRAM_USER_ID --all --live
+```
+
+Recommended live suite order:
+
+```bash
+py -3 dev_scenarios.py --base-url http://127.0.0.1:10000 --secret YOUR_CRON_SECRET --suite onboarding --live --user-id YOUR_TELEGRAM_USER_ID
+py -3 dev_scenarios.py --base-url http://127.0.0.1:10000 --secret YOUR_CRON_SECRET --suite daily_loop --live --user-id YOUR_TELEGRAM_USER_ID
+py -3 dev_scenarios.py --base-url http://127.0.0.1:10000 --secret YOUR_CRON_SECRET --suite focus --live --user-id YOUR_TELEGRAM_USER_ID
+py -3 dev_scenarios.py --base-url http://127.0.0.1:10000 --secret YOUR_CRON_SECRET --suite pressure --live --user-id YOUR_TELEGRAM_USER_ID
+py -3 dev_scenarios.py --base-url http://127.0.0.1:10000 --secret YOUR_CRON_SECRET --suite adaptive --live --user-id YOUR_TELEGRAM_USER_ID
+py -3 dev_scenarios.py --base-url http://127.0.0.1:10000 --secret YOUR_CRON_SECRET --suite weekly --live --user-id YOUR_TELEGRAM_USER_ID
 ```
 
 ### Detailed run steps
@@ -402,6 +485,41 @@ http://127.0.0.1:10000/ops/summary?secret=YOUR_CRON_SECRET
    - `control.events` contains things like `proactive_sent`, `button_tap`, `session_started`, `session_completed`, `message_deferred`, or `message_skipped`
    - `sessions.finishes` changes after `blocked_focus`
    - `onboarding.dropoff_24h` is visible after `onboarding_dropoff`
+
+## Live Verification Checklist
+
+To call the bot "live-ready", verify all of these on the deployed service:
+
+1. Web service is healthy:
+
+```text
+https://brobot-l2g7.onrender.com/health
+```
+
+2. Ops verify works:
+
+```text
+https://brobot-l2g7.onrender.com/ops/verify?secret=YOUR_CRON_SECRET
+```
+
+3. GitHub Actions workflows complete green:
+   - `Brobot Daily`
+   - `Brobot Sessions Tick`
+   - `Brobot Weekly`
+
+4. Real Telegram checks:
+   - start a 5-minute focus session and wait for `Brobot Sessions Tick`
+   - confirm a session nudge or completion prompt appears
+   - wait for a valid daily loop window or manually run `Brobot Daily`
+   - confirm a morning / midday / end-of-day prompt appears when state is eligible
+
+5. If no Telegram messages arrive in live use, check in this order:
+   - GitHub Actions status
+   - `/health`
+   - `/ops/verify`
+   - webhook configuration
+   - user onboarding/profile/intention state
+   - whether the message was deferred/skipped by control logic
 
 ### Control-layer verification
 
