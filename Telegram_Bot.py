@@ -4,6 +4,7 @@ import random
 import asyncio
 import datetime as dt
 import logging
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, Any
@@ -1060,6 +1061,14 @@ def ensure_user(user_id: int, name: str):
         }},
         upsert=True
     )
+
+TEST_USER_NAME_RE = re.compile(r"^test-\d+$")
+
+def live_user_query() -> Dict[str, Any]:
+    return {
+        "is_test_user": {"$ne": True},
+        "name": {"$not": TEST_USER_NAME_RE},
+    }
 
 def get_current_goal(user_id: int):
     return resolve_current_goal(user_id)
@@ -2841,7 +2850,7 @@ async def run_daily_loop_for_user(app: Application, uid: int):
                 state.update_one({"user_id": uid}, {"$set": {"stale_goal_sent_at": now()}}, upsert=True)
 
 async def run_daily_loop_service(app: Application):
-    for u in users.find({}):
+    for u in users.find(live_user_query()):
         uid = u["user_id"]
         try:
             await run_daily_loop_for_user(app, uid)
@@ -2863,7 +2872,7 @@ async def cron_daily(app: Application):
 async def cron_weekly(app: Application):
     """Send a deterministic weekly summary phrased by AI."""
     log_structured("cron_weekly_start")
-    for u in users.find({}):
+    for u in users.find(live_user_query()):
         uid = u["user_id"]
         try:
             facts = weekly_summary_facts(uid)
@@ -3001,7 +3010,7 @@ def seed_test_user(user_id: int, *, timezone: str = "America/Toronto"):
         onboarding_complete=True,
         conversation=None,
     )
-    users.update_one({"user_id": user_id}, {"$set": {"tz": timezone, "checkin_hour": 8}}, upsert=True)
+    users.update_one({"user_id": user_id}, {"$set": {"tz": timezone, "checkin_hour": 8, "is_test_user": True}}, upsert=True)
     set_goal_why(user_id, "optimization-of-brobot", "ship a cleaner bot")
     set_goal_why(user_id, "health", "protect energy")
     users.update_one({"user_id": user_id}, {"$set": {"active_goal": "optimization-of-brobot"}}, upsert=True)
